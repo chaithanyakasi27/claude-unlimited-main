@@ -1,0 +1,96 @@
+name: Release
+
+# Tag-driven. Pushing a v* tag runs the suite, and only if it passes does a
+# draft GitHub Release get created (published by scripts/publish_release.sh) — the updater resolves that release's tag to a
+# commit SHA and refuses to install anything whose contents disagree, so a
+# release must never be published from code that was not tested.
+on:
+  push:
+    tags: ["v*"]
+
+# Only the job that publishes needs write. The verify job below runs the
+# suite and needs nothing beyond reading the checkout.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Tag must match the package version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(python -c 'import claude_unlimited; print(claude_unlimited.__version__)')"
+          echo "tag=$TAG package=$PKG"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match __version__ ($PKG). Bump one or the other."
+            exit 1
+          fi
+
+      - name: Run the test suite
+        run: python -m pytest tests/ -q
+
+      - name: Check JS syntax
+        run: node --check claude_unlimited/static/app.js
+
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # creating the release is the only write this repo does
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Written to a file, never through an ${{ }} expression into a shell
+      # command. Release notes are commit subjects, which are attacker-supplied
+      # text: interpolating them means backticks and $( ) in a commit message
+      # execute in this job.
+      - name: Build release notes
+        run: |
+          PREV="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          {
+            if [ -n "$PREV" ]; then
+              echo "### Changes since $PREV"
+              echo
+              git log --no-merges --pretty='- %s' "$PREV..${GITHUB_REF_NAME}"
+            else
+              echo "First release."
+            fi
+            echo
+            echo "---"
+            echo
+            echo "Install or update:"
+            echo
+            echo '```bash'
+            echo 'curl -fsSL https://raw.githubusercontent.com/DevDock-AI/claude-unlimited/main/install.sh | bash'
+            echo '```'
+          } > release-notes.md
+
+      # A DRAFT, not a published release. Releases in this repository are
+      # immutable once published: nothing can be attached afterwards. The
+      # macOS HUD is built on the maintainer's Mac (its shaders are not in this
+      # repository), so it is attached to the draft and the draft published by
+      # scripts/publish_release.sh. The updater only ever sees published
+      # releases, so nobody can update to one that is missing its HUD.
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --draft \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md \
+            --verify-tag

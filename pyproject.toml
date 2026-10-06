@@ -1,0 +1,92 @@
+[build-system]
+# >=77, not 68: the [project] table below uses PEP 639 license syntax
+# (license = "MIT" + license-files), which setuptools only accepts from 77.
+# With 68 the build dies at metadata generation with an opaque
+# "project.license must be valid exactly by one definition" error — which
+# is what `pip install --no-build-isolation .` hit on setuptools 75.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-unlimited"
+dynamic = ["version"]
+description = "Local daemon that pools Claude Pro/Max subscriptions, Anthropic API keys, and ChatGPT/Codex accounts behind one proxy, with a web Dashboard"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "DevDock" }]
+keywords = ["claude", "claude-code", "anthropic", "openai", "codex", "proxy", "rotation", "daemon", "dashboard"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Internet :: Proxy Servers",
+    "Topic :: Utilities",
+]
+# The ONE approved exception to "zero backend dependencies" — see
+# a recorded, deliberate exception. Used only
+# by claude_unlimited/export_import.py, for authenticated encryption of
+# Export bundles containing real credentials. No other module may import it.
+dependencies = ["cryptography>=42"]
+
+# Not a runtime dependency: the daemon still needs only the standard library
+# plus cryptography. This is what `pip install -e ".[dev]"` adds so the test
+# suite can run.
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/DevDock-AI/claude-unlimited"
+Repository = "https://github.com/DevDock-AI/claude-unlimited"
+Issues = "https://github.com/DevDock-AI/claude-unlimited/issues"
+Funding = "https://ko-fi.com/devdock"
+
+[project.scripts]
+claude-unlimited = "claude_unlimited.cli:main"
+# Short alias, same entrypoint: `cu code`, `cu status`, `cu doctor`, …
+# Console scripts are generated at install time, so an existing install
+# only gains `cu` after a reinstall.
+cu = "claude_unlimited.cli:main"
+
+[tool.setuptools.dynamic]
+# Read from claude_unlimited/__init__.py rather than restated here. The two
+# had already drifted — this said 0.1.0 while the package said 1.1.8, so a
+# `pip install .` recorded the wrong version and nothing caught it: CI only
+# compares the git tag against __version__.
+version = { attr = "claude_unlimited.__version__" }
+
+[tool.pytest.ini_options]
+# Collect ONLY from tests/. Without this pytest walks the package too and
+# grabs claude_unlimited/connection_test.py — a real runtime module (it sends
+# a live probe request for a Profile), whose public function
+# `test_connection(profile_id, ...)` looks like a test wanting a `profile_id`
+# fixture. Scoping collection fixes it without renaming a shipped API.
+testpaths = ["tests"]
+
+[tool.setuptools]
+packages = ["claude_unlimited", "claude_unlimited.secret_store", "claude_unlimited.daemon_installer"]
+
+[tool.setuptools.package-data]
+# static/ and locales/ are plain data directories (no __init__.py, so they're
+# not "packages") — without this, a real `pip install .` silently omits the
+# Dashboard's HTML/JS and every locale file from the installed package: the
+# daemon would start, but / and /app.js would 404 and i18n would have
+# nothing to load. Caught before it ever shipped, by actually building the
+# install rather than assuming `packages` alone covers it.
+# NOTE: these globs do NOT recurse. "static/*" matches the `vendor`
+# DIRECTORY entry but none of the files inside it, so the vendored chart
+# library was absent from an installed build: /vendor/charts.js would 404,
+# the chart global would be undefined and the Statistics chart would silently
+# fail to render. Same class of bug the comment above records — it needs a
+# glob per directory level.
+claude_unlimited = ["static/*", "static/vendor/*", "locales/*", "data/*"]

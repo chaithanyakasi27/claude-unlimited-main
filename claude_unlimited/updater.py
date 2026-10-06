@@ -1,0 +1,410 @@
+"""Checks for, downloads, verifies and installs a new release.
+
+TRUST ROOT — the decision this feature was blocked on, made explicit:
+
+  1. The source is hardcoded. GITHUB_OWNER/GITHUB_REPO below are constants,
+     never read from config, never from a response body, never from an
+     environment variable in a normal run. Nothing an attacker can write to
+     `~/.claude-unlimited/config.json` can point the updater somewhere else.
+  2. Every network call is HTTPS with certificate verification (the stdlib
+     default). Redirects to a non-HTTPS URL are rejected.
+  3. The downloaded tree is verified by content, not by trusting the
+     transport twice. The release API names a commit SHA; git clones the tag
+     and reports the SHA it actually got. Git objects are content-addressed,
+     so a tree whose bytes were altered in flight cannot produce the expected
+     SHA. The install only proceeds when the two agree.
+  4. The previous installation is kept and restored if the new one fails to
+     import, so a bad release degrades to "still on the old version" rather
+     than a broken daemon.
+
+What this deliberately does NOT claim: it is not a signature check. It
+proves the code came from this repository's history as GitHub reports it;
+it cannot prove GitHub itself, or an account with push access, is honest.
+A detached-signature check can layer on top of step 3 later without
+changing anything else here.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Optional
+
+GITHUB_OWNER = "DevDock-AI"
+GITHUB_REPO = "claude-unlimited"
+RELEASES_LATEST_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+COMMIT_REF_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/commits/{{ref}}"
+CLONE_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}.git"
+
+INSTALL_ROOT = Path.home() / ".local" / "share" / "claude-unlimited"
+APP_DIR = INSTALL_ROOT / "app"
+PREVIOUS_APP_DIR = INSTALL_ROOT / "app.previous"
+# A venv puts its interpreter under Scripts\python.exe on Windows and bin/python
+# elsewhere. Hardcoding the POSIX layout made every self-update fail on Windows
+# with a "re-run install.sh" message (a bash script Windows can't run).
+import os as _os
+VENV_PYTHON = INSTALL_ROOT / "venv" / ("Scripts" if _os.name == "nt" else "bin") / (
+    "python.exe" if _os.name == "nt" else "python")
+# Where the venv's own console scripts land (pip generates one per name in
+# pyproject [project.scripts] — `claude-unlimited` AND `cu`).
+VENV_SCRIPTS = INSTALL_ROOT / "venv" / ("Scripts" if _os.name == "nt" else "bin")
+# Where the user-facing launchers live, mirroring install.sh / install.ps1.
+BIN_DIR = Path.home() / ".local" / "bin"
+# The command names this project exposes; both run claude_unlimited.cli:main.
+CLI_NAMES = ("claude-unlimited", "cu")
+
+NETWORK_TIMEOUT_SECONDS = 20
+SUBPROCESS_TIMEOUT_SECONDS = 300
+
+
+class UpdateError(RuntimeError):
+    """Any failure that leaves the current installation untouched."""
+
+
+@dataclass(frozen=True)
+class Release:
+    version: str  # normalized, no leading "v"
+    tag: str  # the tag exactly as GitHub names it
+    commit_sha: str
+    notes: str
+
+
+def parse_version(raw: str) -> tuple:
+    """(1, 2, 3) from "v1.2.3". Non-numeric trailing parts are dropped rather
+    than guessed at, so a pre-release tag compares as its base version."""
+    cleaned = raw.strip().lstrip("vV")
+    parts = re.split(r"[.\-+]", cleaned)
+    numbers = []
+    for part in parts:
+        if not part.isdigit():
+            break
+        numbers.append(int(part))
+    return tuple(numbers) or (0,)
+
+
+def is_newer(candidate: str, current: str) -> bool:
+    return parse_version(candidate) > parse_version(current)
+
+
+class NoReleasesYet(UpdateError):
+    """The repository has no published release. A normal state for a project
+    before its first tag, not a failure worth reporting to the user."""
+
+
+def _get_json(url: str, opener: Callable) -> dict:
+    request = urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"{GITHUB_REPO}-updater",
+    })
+    try:
+        with opener(request, timeout=NETWORK_TIMEOUT_SECONDS) as response:
+            if not response.geturl().startswith("https://"):
+                raise UpdateError("Refusing a non-HTTPS redirect while checking for updates.")
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise NoReleasesYet("No releases published yet.") from exc
+        raise UpdateError(f"GitHub returned HTTP {exc.code}.") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise UpdateError(f"Could not reach GitHub: {exc}") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise UpdateError(f"GitHub returned something that isn't JSON: {exc}") from exc
+
+
+def check_for_update(current_version: str, *, opener: Callable = urllib.request.urlopen) -> Optional[Release]:
+    """The newest release if it is newer than `current_version`, else None.
+
+    Resolves the tag to a commit SHA in the same pass, so the verification
+    step later has something to compare against that was fetched before any
+    code was downloaded."""
+    payload = _get_json(RELEASES_LATEST_URL, opener)
+    tag = (payload.get("tag_name") or "").strip()
+    if not tag:
+        raise UpdateError("The latest release has no tag name.")
+    version = tag.lstrip("vV")
+    if not is_newer(version, current_version):
+        return None
+
+    commit = _get_json(COMMIT_REF_URL.format(ref=tag), opener)
+    sha = (commit.get("sha") or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise UpdateError(f"GitHub reported an unusable commit SHA for {tag!r}.")
+    return Release(version=version, tag=tag, commit_sha=sha,
+                    notes=(payload.get("body") or "").strip())
+
+
+def _clear_readonly_and_retry(func, path, _exc=None) -> None:
+    """`shutil.rmtree` error hook that survives read-only files.
+
+    Git marks everything it writes under `.git/objects` read-only. On Windows
+    a file's own read-only attribute blocks deletion outright; on POSIX,
+    deleting only needs write permission on the *parent directory*, so the
+    same tree removes cleanly there. That makes this a Windows-only failure —
+    and ignoring the error silently left a partial `.git` behind, which made
+    the next `git clone` refuse the destination forever."""
+    try:
+        _os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except OSError:
+        pass  # still best-effort; a tree we cannot clear is reported by caller
+
+
+def _rmtree(path: Path) -> None:
+    """Best-effort recursive delete that actually succeeds on a git checkout
+    under Windows, which ignoring errors did not."""
+    if not Path(path).exists():
+        return
+    # `onerror` is deprecated from 3.12 and `onexc` does not exist before it;
+    # this project supports 3.10+, so pick per interpreter rather than pin one.
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_clear_readonly_and_retry)
+    else:
+        shutil.rmtree(path, onerror=_clear_readonly_and_retry)
+
+
+def _has_entries(path: Path) -> bool:
+    """True if `path` still holds anything — i.e. a delete did not finish."""
+    try:
+        return path.exists() and any(path.iterdir())
+    except OSError:
+        return True  # unreadable is not "safely empty"
+
+
+def _is_windows() -> bool:
+    """Platform check as a seam, so tests can fake it without touching
+    `os.name`.
+
+    `pathlib` picks WindowsPath or PosixPath from `os.name` at instantiation,
+    so a test that monkeypatched the real `os.name` to "nt" made every Path
+    built while it was patched a WindowsPath — which raises NotImplementedError
+    on POSIX. Those tests passed on Windows (where the patch is a no-op) and
+    failed everywhere else. Patch this instead."""
+    return _os.name == "nt"
+
+
+def _install_interpreter(venv_python: Path) -> tuple:
+    """The interpreter an update installs into, plus any extra pip flags.
+
+    install.sh builds a venv at INSTALL_ROOT/venv and the updater installs
+    into it. install.ps1 deliberately does not — it runs `pip install --user`
+    against the system interpreter and writes .cmd launchers — so on Windows
+    there is no venv to find, and demanding one failed every self-update with
+    a message telling the user to re-run a bash script they never ran."""
+    if venv_python.exists():
+        return venv_python, []
+    if _is_windows():
+        # pip refuses --user inside an active virtualenv, and the daemon may
+        # well be running inside one; only pass it when we are not.
+        in_venv = sys.prefix != sys.base_prefix
+        return Path(sys.executable), ([] if in_venv else ["--user"])
+    raise UpdateError(f"No virtual environment at {venv_python}. Re-run install.sh instead.")
+
+
+def _run(command: list, runner: Callable) -> subprocess.CompletedProcess:
+    try:
+        return runner(command, capture_output=True, text=True,
+                      timeout=SUBPROCESS_TIMEOUT_SECONDS, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise UpdateError(f"Command failed to run ({command[0]}): {exc}") from exc
+
+
+def stage_release(release: Release, destination: Path, *, runner: Callable = subprocess.run) -> Path:
+    """Clones the release's tag and refuses unless the commit git actually
+    checked out is the one the API named. Git objects are content-addressed,
+    so this is a content check, not a second appeal to the transport."""
+    if destination.exists():
+        _rmtree(destination)
+        if _has_entries(destination):
+            raise UpdateError(
+                f"Could not clear the staging directory {destination} — something "
+                f"in it could not be deleted. Remove it by hand and try again.")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    clone = _run(["git", "clone", "--depth", "1", "--branch", release.tag,
+                  CLONE_URL, str(destination)], runner)
+    if clone.returncode != 0:
+        raise UpdateError(f"Could not download {release.tag}: {(clone.stderr or '').strip()[:200]}")
+
+    head = _run(["git", "-C", str(destination), "rev-parse", "HEAD"], runner)
+    got = (head.stdout or "").strip()
+    if got != release.commit_sha:
+        _rmtree(destination)
+        raise UpdateError(
+            f"Refusing to install {release.tag}: downloaded commit {got[:12] or '?'} "
+            f"does not match the {release.commit_sha[:12]} GitHub named for that tag.")
+    return destination
+
+
+def _ensure_windows_alias() -> None:
+    """Windows has no symlinks we can rely on; install.ps1 drops a
+    `claude-unlimited.cmd` launcher in %LOCALAPPDATA%\\Microsoft\\WindowsApps
+    (always on PATH). Mirror it to `cu.cmd` so the short name works too — both
+    launchers differ only in which generated .exe they prefer, and both fall
+    back to `-m claude_unlimited`."""
+    windows_apps = Path(_os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WindowsApps"
+    src = windows_apps / "claude-unlimited.cmd"
+    if not src.exists():
+        return
+    try:
+        text = src.read_text(encoding="ascii", errors="ignore")
+        (windows_apps / "cu.cmd").write_text(
+            text.replace("claude-unlimited.exe", "cu.exe"), encoding="ascii")
+    except OSError:
+        pass
+
+
+def ensure_cli_aliases(*, venv_scripts: Path = VENV_SCRIPTS, bin_dir: Path = BIN_DIR) -> None:
+    """Make every CLI_NAMES launcher reachable, self-healing an install that
+    predates a name being added.
+
+    The `cu` alias shipped in 1.2.6, but install.sh only ever symlinked
+    `claude-unlimited` and the updater relinked nothing — so existing installs
+    pip-regenerated `venv/bin/cu` on update yet never got `~/.local/bin/cu`,
+    and `cu` stayed 'command not found' no matter how many times someone
+    updated. Running this on every install closes that gap for both names."""
+    if _is_windows():
+        _ensure_windows_alias()
+        return
+    try:
+        bin_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    for name in CLI_NAMES:
+        target = venv_scripts / name
+        if not target.exists():
+            continue  # pip didn't generate it (e.g. an old release predating the name)
+        link = bin_dir / name
+        try:
+            if link.is_symlink():
+                if link.resolve() == target.resolve():
+                    continue  # already correct
+                # Only ever replace a link that points into OUR install. `cu`
+                # is a common personal alias / real binary name — never clobber
+                # a foreign symlink, and never touch a regular file we didn't
+                # create. (Replacing our own stale link is fine.)
+                try:
+                    if not str(link.resolve()).startswith(str(INSTALL_ROOT)):
+                        continue
+                except OSError:
+                    continue  # dangling/foreign symlink — leave it alone
+                link.unlink()
+            elif link.exists():
+                continue  # a real file named `cu`/`claude-unlimited` that isn't ours
+            link.symlink_to(target)
+        except OSError:
+            pass  # a launcher we couldn't write is not worth failing an update over
+
+
+def install_staged(staged: Path, *, runner: Callable = subprocess.run,
+                   app_dir: Path = APP_DIR, previous_dir: Path = PREVIOUS_APP_DIR,
+                   venv_python: Path = VENV_PYTHON, bin_dir: Path = BIN_DIR) -> None:
+    """Installs an already-verified tree, keeping the old one to roll back to.
+
+    The new code is proven importable before the old copy is released, so a
+    release that cannot even load leaves the daemon on the version that
+    works."""
+    if not staged.joinpath("pyproject.toml").exists():
+        raise UpdateError("The downloaded tree does not look like this project.")
+    python, pip_flags = _install_interpreter(venv_python)
+
+    _rmtree(staged / ".git")
+    if previous_dir.exists():
+        _rmtree(previous_dir)
+    if app_dir.exists():
+        shutil.move(str(app_dir), str(previous_dir))
+    shutil.move(str(staged), str(app_dir))
+
+    def _roll_back(reason: str):
+        _rmtree(app_dir)
+        if previous_dir.exists():
+            shutil.move(str(previous_dir), str(app_dir))
+            _run([str(python), "-m", "pip", "install", "--force-reinstall",
+                  *pip_flags, "--no-deps", "-q", str(app_dir)], runner)
+        raise UpdateError(reason)
+
+    installed = _run([str(python), "-m", "pip", "install", "--force-reinstall",
+                      *pip_flags, "--no-deps", "-q", str(app_dir)], runner)
+    if installed.returncode != 0:
+        _roll_back(f"Install failed, rolled back: {(installed.stderr or '').strip()[:200]}")
+
+    check = _run([str(python), "-c", "import claude_unlimited"], runner)
+    if check.returncode != 0:
+        _roll_back(f"The new version could not be imported, rolled back: "
+                    f"{(check.stderr or '').strip()[:200]}")
+
+    # pip regenerated the venv's console scripts above; make sure every CLI
+    # name is reachable from the user's bin dir. Best-effort — a launcher we
+    # can't write must never fail or roll back an otherwise-good update.
+    ensure_cli_aliases(venv_scripts=python.parent, bin_dir=bin_dir)
+
+
+STAGING_DIR = INSTALL_ROOT / "staged-update"
+
+# What a mode does when a newer release exists:
+#   manual         -> report it, touch nothing
+#   auto_download  -> download and verify, leave it staged for a click
+#   auto_install   -> download, verify and install
+MODE_DOWNLOADS = ("auto_download", "auto_install")
+MODE_INSTALLS = ("auto_install",)
+
+
+@dataclass(frozen=True)
+class UpdateOutcome:
+    release: Optional[Release]
+    # "none" | "no_releases" | "available" | "downloaded" | "installed"
+    #
+    # "no_releases" is deliberately NOT folded into "none". They look alike
+    # from here but mean opposite things to the person reading the dashboard:
+    # "none" means we asked and you already have the newest release, while
+    # "no_releases" means the repository has published none at all. Collapsing
+    # them made the UI claim "You're on the latest release" for a repo with no
+    # releases — a sentence that is simply untrue.
+    action: str
+    error: Optional[str] = None
+
+    @property
+    def needs_restart(self) -> bool:
+        return self.action == "installed"
+
+
+def run_update_cycle(current_version: str, mode: str, *,
+                     opener: Callable = urllib.request.urlopen,
+                     runner: Callable = subprocess.run,
+                     staging_dir: Path = STAGING_DIR) -> UpdateOutcome:
+    """One full check-and-act pass, doing only what `mode` allows.
+
+    Never raises: a failed update must not take the daemon down with it, and
+    the caller is a background loop that should simply try again later."""
+    try:
+        release = check_for_update(current_version, opener=opener)
+    except NoReleasesYet:
+        return UpdateOutcome(release=None, action="no_releases")
+    except UpdateError as exc:
+        return UpdateOutcome(release=None, action="none", error=str(exc))
+    if release is None:
+        return UpdateOutcome(release=None, action="none")
+
+    if mode not in MODE_DOWNLOADS:
+        return UpdateOutcome(release=release, action="available")
+
+    try:
+        staged = stage_release(release, staging_dir, runner=runner)
+    except UpdateError as exc:
+        return UpdateOutcome(release=release, action="available", error=str(exc))
+
+    if mode not in MODE_INSTALLS:
+        return UpdateOutcome(release=release, action="downloaded")
+
+    try:
+        install_staged(staged, runner=runner)
+    except UpdateError as exc:
+        return UpdateOutcome(release=release, action="downloaded", error=str(exc))
+    return UpdateOutcome(release=release, action="installed")

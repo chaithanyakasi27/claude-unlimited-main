@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_URL="${CLAUDE_UNLIMITED_REPO:-https://github.com/DevDock-AI/claude-unlimited.git}"
+REPO_BRANCH="${CLAUDE_UNLIMITED_BRANCH:-main}"
+INSTALL_ROOT="$HOME/.local/share/claude-unlimited"
+BIN_DIR="$HOME/.local/bin"
+
+# Works two ways: run from a checkout (./install.sh), or piped straight from
+# the network (curl … | bash), in which case there is no checkout to copy from
+# and the sources are cloned into a temp directory first.
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "$(dirname "${BASH_SOURCE[0]}")/pyproject.toml" ]; then
+  SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  CLONED=""
+else
+  SOURCE_DIR="$(mktemp -d)"
+  CLONED="$SOURCE_DIR"
+fi
+cleanup() { [ -n "$CLONED" ] && rm -rf "$CLONED" || true; }
+trap cleanup EXIT
+
+echo "Claude Unlimited installer"
+echo "=========================="
+
+missing=""
+command -v python3 >/dev/null 2>&1 || missing="$missing python3"
+command -v claude  >/dev/null 2>&1 || missing="$missing claude"
+[ -n "$CLONED" ] && { command -v git >/dev/null 2>&1 || missing="$missing git"; }
+if [ -n "$missing" ]; then
+  echo "Missing required command(s):$missing" >&2
+  echo "Install them first, then re-run this installer." >&2
+  exit 1
+fi
+
+if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'; then
+  echo "Python 3.10 or newer is required (found $(python3 -V 2>&1))." >&2
+  exit 1
+fi
+
+# Debian/Ubuntu ship python3 WITHOUT venv/ensurepip — `python3 -m venv` then
+# fails halfway through this script. Check up front with an actionable message
+# rather than aborting mid-install after files are already copied.
+if ! python3 -c 'import ensurepip, venv' >/dev/null 2>&1; then
+  echo "Python's venv/ensurepip module is missing — on Debian/Ubuntu install it with:" >&2
+  echo "  sudo apt install python3-venv" >&2
+  exit 1
+fi
+
+# curl is used for the health probe near the end; warn (don't abort) if absent
+# so the install still completes on a minimal server without it.
+command -v curl >/dev/null 2>&1 || echo "NOTE: curl not found — skipping the post-install dashboard health check."
+
+if [ -n "$CLONED" ]; then
+  echo "Downloading Claude Unlimited…"
+  git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$SOURCE_DIR" --quiet
+fi
+
+mkdir -p "$INSTALL_ROOT" "$BIN_DIR"
+rm -rf "$INSTALL_ROOT/app"
+cp -R "$SOURCE_DIR" "$INSTALL_ROOT/app"
+rm -rf "$INSTALL_ROOT/app/.git"
+find "$INSTALL_ROOT/app" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+
+echo "Setting up an isolated environment…"
+python3 -m venv "$INSTALL_ROOT/venv"
+# --no-cache-dir: this venv is built once and never shares wheels with
+# anything else, so the cache buys nothing — and a corrupt entry in the user's
+# existing pip cache prints alarming warnings during an otherwise clean
+# install.
+PIP="$INSTALL_ROOT/venv/bin/pip"
+"$PIP" install --upgrade pip -q --no-cache-dir --disable-pip-version-check
+"$PIP" install "$INSTALL_ROOT/app" -q --no-cache-dir --disable-pip-version-check
+
+# Symlink the venv's own console_scripts (pyproject's [project.scripts]) so the
+# commands on PATH always match what was installed, with dependencies resolved,
+# instead of a wrapper hoping the system python3 has cryptography. Both names
+# ship — `claude-unlimited` and the short alias `cu` — so link both.
+ln -sf "$INSTALL_ROOT/venv/bin/claude-unlimited" "$BIN_DIR/claude-unlimited"
+ln -sf "$INSTALL_ROOT/venv/bin/cu" "$BIN_DIR/cu"
+
+echo
+echo "Installed: $BIN_DIR/claude-unlimited (also as: cu)"
+case ":$PATH:" in
+  *":$BIN_DIR:"*) ;;
+  *)
+    echo
+    echo "NOTE: $BIN_DIR is not on your PATH. Add this to your shell profile:"
+    echo '  export PATH="$HOME/.local/bin:$PATH"'
+    ;;
+esac
+
+CLI="$BIN_DIR/claude-unlimited"
+
+echo
+echo "Checking the install…"
+echo
+if ! "$CLI" doctor; then
+  echo
+  echo "Install finished, but the check above found something. Fix it, then run:"
+  echo "  claude-unlimited doctor"
+  exit 1
+fi
+
+# The dashboard is where accounts are actually added, so it is worth being one
+# click away rather than a command the reader has to find. Started detached:
+# this makes it usable right now, while `claude-unlimited install` is what
+# makes it come back on login.
+PORT="${CLAUDE_UNLIMITED_PORT:-4317}"
+# Digits only. It reaches a URL and a command line, and every expansion here is
+# quoted, but validating the shape is cheaper than reasoning about whether
+# every future use stays quoted.
+case "$PORT" in
+  ''|*[!0-9]*) echo "CLAUDE_UNLIMITED_PORT must be a number, got: $PORT" >&2; exit 1 ;;
+esac
+URL="http://127.0.0.1:${PORT}/"
+
+# Registered as a login service by default. The alternative is a detached
+# process that dies with the terminal or the next reboot, leaving a tool whose
+# whole job is to be there when Claude Code needs it silently absent. It can be
+# turned off in Settings, which is also where its state is visible.
+echo
+echo "Setting it to run in the background…"
+# `install` stops whatever already holds the port and then verifies the daemon
+# answering is the version just installed, so its exit status is meaningful —
+# don't discard it. Upgrading over a running daemon used to report success
+# while the OLD version kept serving, because nobody checked.
+if INSTALL_OUTPUT="$("$CLI" install --port "$PORT" 2>&1)"; then
+  echo "Background service: installed (starts on login)"
+else
+  echo "$INSTALL_OUTPUT" >&2
+  echo "Background service: could not be installed — starting it for this session only"
+  nohup "$CLI" start --port "$PORT" >/dev/null 2>&1 &
+fi
+
+# macOS gets the HUD — the floating dock of accounts — without asking for it.
+# Non-fatal on purpose: a failed download is a missing ornament, not a failed
+# install, and `cu hud install` retries it whenever the user wants.
+if [ "$(uname -s)" = "Darwin" ]; then
+  echo
+  echo "Installing HUD - Heads-Up Display…"
+  "$CLI" hud install || echo "The HUD could not be installed right now — try later with: cu hud install"
+fi
+
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  curl -fsS --max-time 1 "${URL}health" >/dev/null 2>&1 && break
+  sleep 0.5
+done
+
+echo
+if curl -fsS --max-time 2 "${URL}health" >/dev/null 2>&1; then
+  echo "Dashboard: $URL"
+  case "$(uname -s)" in
+    Darwin) open "$URL" >/dev/null 2>&1 || true ;;
+    Linux)  command -v xdg-open >/dev/null 2>&1 && (xdg-open "$URL" >/dev/null 2>&1 || true) ;;
+  esac
+else
+  echo "The daemon did not come up. Start it yourself with:"
+  echo "  claude-unlimited start"
+fi
+
+echo
+echo "Next steps:"
+echo "  Add an API key from the dashboard, or add a subscription:"
+echo "    claude-unlimited add-account         # a Claude subscription"
+echo "    claude-unlimited add-codex-account   # a ChatGPT/Codex subscription"
+echo "  claude-unlimited uninstall             # stop it starting on login"
+echo
+echo "To remove everything later:"
+echo "  claude-unlimited purge"

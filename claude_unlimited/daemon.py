@@ -1,0 +1,2150 @@
+"""The daemon's HTTP surface: /health, the Dashboard management API (/api/*),
+and the live proxy (everything else, e.g. /v1/messages) via Gateway.
+
+Route namespaces are strictly partitioned: /api/* (management, CSRF and Host
+checked, never touches an Anthropic credential) and everything else (proxy,
+placeholder-token checked, never touches the Dashboard's CSRF token) share a
+listener but never share auth logic.
+
+Security posture:
+  - Binds to 127.0.0.1 only, and refuses any other bind target loudly.
+  - Every request's Host header must name this daemon, which blocks
+    DNS-rebinding attacks from a malicious page in the same browser.
+  - No CORS headers are ever sent, so no origin gets cross-origin access.
+  - State-changing requests (POST/PATCH/DELETE) require a per-run CSRF token,
+    generated at daemon start, never persisted, and embedded only in the HTML
+    this daemon serves.
+  - Every response sets Cache-Control: no-store and a strict CSP.
+  - Profile JSON responses never include a credential value; Profile has no
+    such field (see config.py) and secrets live only in secret_store.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import platform
+import secrets
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+if platform.system() != "Windows":
+    import resource  # POSIX-only stdlib module, absent on Windows
+from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Optional
+from urllib.parse import parse_qs, urlparse
+
+from . import __version__
+from . import db
+from . import usage_probe
+from . import activity
+from . import anthropic_oauth
+from . import connection_test
+from . import context_window
+from . import daemon_installer
+from . import export_import
+from . import hud
+from . import i18n
+from . import model_catalogue
+from . import notifications
+from . import openai_models
+from . import openai_observation
+from . import placeholder_token
+from . import pricing
+from . import profiles as profile_repo
+from . import project_attribution
+from . import project_usage
+from . import session_tokens
+from . import updater
+from . import usage_history
+from .config import APP_DIR, DEFAULT_SWITCH_THRESHOLD, ensure_app_dir, load_pool, update_settings
+from .gateway import Gateway
+from .router import spending_on_credits
+
+LOOPBACK_HOST = "127.0.0.1"
+DEFAULT_PORT = 4317
+ALLOWED_HOST_NAMES = {"127.0.0.1", "localhost", "claude.unlimited"}
+
+
+def _qs_int(qs: dict, key: str, default: int, *, minimum: int, maximum: int) -> int:
+    """A clamped integer from a query string, tolerating rubbish.
+
+    A query string is user input — a typo in a pasted URL, a stale bookmark,
+    anything. `int(qs["days"][0])` raised ValueError straight out of the
+    handler, so `?days=abc` answered 500 rather than simply ignoring a value
+    it could not use."""
+    raw = qs.get(key, [str(default)])[0]
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = default
+    return min(max(value, minimum), maximum)
+
+
+# Paths that serve the Dashboard itself, so a refresh or a pasted link opens
+# the right view. An explicit set, never a prefix or a catch-all: this daemon
+# is also a live proxy, and every unknown path falls through to be forwarded
+# upstream. A catch-all here would swallow real traffic.
+_VIEW_ROUTES = frozenset({
+    "/", "/profiles", "/stats", "/activity", "/settings", "/help",
+})
+
+_gateway = Gateway()
+_DAEMON_STARTED_AT = datetime.now(timezone.utc)
+_STATIC_DIR = Path(__file__).parent / "static"
+_INDEX_HTML = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
+_APP_JS = (_STATIC_DIR / "app.js").read_text(encoding="utf-8")
+_FAVICON_SVG = (_STATIC_DIR / "favicon.svg").read_text(encoding="utf-8")
+# Vendored rather than loaded from a CDN: the Dashboard is loopback-only and
+# must keep working offline, and drawing a chart is no reason to tell a third
+# party that this daemon is running.
+_CHARTS_JS = (_STATIC_DIR / "vendor" / "charts.js").read_text(encoding="utf-8")
+_CHARTS_CSS = (_STATIC_DIR / "vendor" / "charts.css").read_text(encoding="utf-8")
+
+# Regenerated every daemon start; lives only in this process's memory.
+_CSRF_TOKEN = secrets.token_urlsafe(32)
+
+
+class _RefusesNonLoopbackBind(RuntimeError):
+    pass
+
+
+def _assert_bound_to_loopback(server: ThreadingHTTPServer) -> None:
+    bound_host = server.server_address[0]
+    if bound_host not in ("127.0.0.1", "::1"):
+        server.server_close()
+        raise _RefusesNonLoopbackBind(
+            f"Refusing to run: daemon socket bound to {bound_host!r}, not a loopback "
+            "address."
+        )
+
+
+def _security_headers() -> dict:
+    return {
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": (
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; "
+            "form-action 'self'; frame-ancestors 'none'"
+        ),
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+    }
+
+
+# Router state -> the word the Dashboard shows.
+_STATUS_WORDS = {
+    "eligible": "healthy",
+    "draining": "almost exhausted",
+    "exhausted": "exhausted",
+    "cooldown": "cooldown",
+    "auth_invalid": "needs re-auth",
+    "disabled": "disabled",
+}
+
+# Defined unconditionally: declaring a struct layout has no OS-specific side
+# effect and ctypes.wintypes imports on any platform, so this stays testable
+# off Windows. Only using it via ctypes.windll below is Windows-only.
+import ctypes
+import ctypes.wintypes as wintypes
+
+
+class _PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("PageFaultCount", wintypes.DWORD),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+    ]
+
+
+def _memory_mb() -> float:
+    if platform.system() == "Windows":
+        # UNVERIFIED on a real Windows machine, like the other Windows
+        # backends. GetProcessMemoryInfo is the documented, dependency-free
+        # (ctypes + psapi.dll) way to read a process's own working set.
+        counters = _PROCESS_MEMORY_COUNTERS()
+        counters.cb = ctypes.sizeof(_PROCESS_MEMORY_COUNTERS)
+        handle = ctypes.windll.kernel32.GetCurrentProcess()
+        ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
+        return round(counters.WorkingSetSize / (1024 * 1024), 1)
+
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    # macOS reports ru_maxrss in bytes, Linux in KB, per getrusage(2).
+    divisor = 1024 * 1024 if platform.system() == "Darwin" else 1024
+    return round(usage.ru_maxrss / divisor, 1)
+
+
+def _process_stats() -> dict:
+    memory_mb = _memory_mb()
+    service = daemon_installer.status()
+    return {
+        "pid": os.getpid(),
+        "uptime_seconds": (datetime.now(timezone.utc) - _DAEMON_STARTED_AT).total_seconds(),
+        "memory_mb": memory_mb,
+        "installed_as_service": service["installed"],
+        "running_as_service": service["running"],
+    }
+
+
+def _window_label_for_display(p, runtime, label_attr: str, resets_attr: str):
+    """A codex Profile's window label, derived from its reset time when the
+    backend omitted x-codex-*-window-minutes and no label was recorded.
+
+    Codex-only on purpose: oauth and api Profiles have Anthropic's fixed
+    5h/7d windows, and the Dashboard's own labels for those must win.
+    Without this, a weekly-only account would show whatever label was
+    persisted at observation time until the next live request."""
+    if runtime is None:
+        return None
+    recorded = getattr(runtime, label_attr, None)
+    if recorded or p.kind != "codex":
+        return recorded
+    return openai_observation.label_from_reset_distance(
+        getattr(runtime, resets_attr, None), datetime.now(timezone.utc))
+
+
+_CLIENT_VERSION_CACHE: dict = {}
+_CLIENT_VERSION_TTL_SECONDS = 300.0
+
+
+def _cached_client_version():
+    """The installed Claude Code version, re-read at most every few minutes.
+
+    /api/settings is polled by an open dashboard, and forking `claude
+    --version` on every poll would be absurd. A version only changes when the
+    client updates, so a stale answer for a few minutes is harmless."""
+    now = time.monotonic()
+    cached = _CLIENT_VERSION_CACHE.get("value")
+    if cached is not None and now - _CLIENT_VERSION_CACHE.get("at", 0.0) < _CLIENT_VERSION_TTL_SECONDS:
+        return cached[0]
+    from .cli import _installed_client_version
+
+    try:
+        version = _installed_client_version()
+    except Exception:
+        version = None
+    # Boxed in a tuple so a legitimate None is cached too, rather than
+    # re-forking on every poll for a client that is not installed.
+    _CLIENT_VERSION_CACHE["value"] = (version,)
+    _CLIENT_VERSION_CACHE["at"] = now
+    return version
+
+
+def _context_1m_preview(pool) -> dict:
+    """{"enabled", "reason"[, "guard"]} for a session launched now with no
+    `--profile` and nothing set in the environment — the common case, and the
+    one a user looking at Settings is asking about.
+
+    `guard` is present whenever a codex Profile is in the route: one entry per
+    such account with the window the per-request capacity guard (docs/adr/
+    0009) budgets it at, so the dashboard can say "up to ~226K on this one;
+    longer turns go to a Claude account" — and flag any GPT id whose window
+    is ASSUMED rather than known."""
+    mode = getattr(pool.settings, "context_1m", "force_1m")
+    version = _cached_client_version() if mode == "auto" else None
+    profiles = pool.enabled_profiles()
+    enabled, reason = context_window._one_million_decision(mode, profiles, None, {}, version)
+    preview = {"enabled": enabled, "reason": reason}
+    codex = context_window.codex_profiles_in_route(profiles, None)
+    if codex:
+        entries = []
+        for p in codex:
+            summary = openai_models.codex_profile_windows(p, pool.settings.model_parity)
+            entries.append({"id": p.id, "name": p.name, **summary})
+        preview["guard"] = {"profiles": entries, "assumed": any(e["assumed"] for e in entries)}
+    return preview
+
+
+def _profile_to_public_dict(p, runtime=None, usage=None, in_use_now=False) -> dict:
+    """The wire shape sent to the browser. Explicit allowlist, not asdict(),
+    so a future field added to Profile can't accidentally leak by default.
+
+    `runtime` is the live Gateway.ProfileRuntime for this Profile, or None
+    until the daemon has observed it at least once, in which case the
+    Dashboard falls back to the configured enabled/disabled state.
+
+    `usage` is this Profile's lifetime {"tokens", "cost_usd"} from
+    usage_history.usage_by_profile(). An api-kind Profile has no
+    session-based rate-limit window to show, so the Dashboard shows this
+    instead. None reads as "no usage recorded yet", not "unknown".
+
+    `in_use_now` (see Gateway.in_flight_ids()) differs from
+    current_profile_id in GET /api/status: several Profiles can be in use at
+    once via concurrent pinned `code --profile` sessions, while
+    current_profile_id is a single shared rotation pointer."""
+    state_value = runtime.state.value if runtime is not None else ("eligible" if p.enabled else "disabled")
+    usage = usage or {}
+    return {
+        "id": p.id,
+        "name": p.name,
+        "kind": p.kind,
+        "base_url": p.base_url,
+        "auth_mode": p.auth_mode,
+        "priority": p.priority,
+        "switch_threshold": p.switch_threshold,
+        "enabled": p.enabled,
+        "automatic": p.automatic,
+        "default_model": p.default_model,
+        "force_model": p.force_model,
+        "monthly_budget_cap": p.monthly_budget_cap,
+        "token_threshold": p.token_threshold,
+        "tag_color": p.tag_color,
+        "account_uuid": p.account_uuid,
+        "plan": p.plan,
+        "codex_home": p.codex_home,
+        "codex_model": p.codex_model,
+        "codex_reasoning_effort": p.codex_reasoning_effort,
+        "forced_for_subagents": getattr(p, "forced_for_subagents", False),
+        # "Leave when Fable is spent" — the Profile's OWN switch, as configured.
+        # The pool-wide override (Settings.fable_limit_all_profiles) is not
+        # folded in here: the card shows what this Profile has set.
+        "leave_on_fable_limit": getattr(p, "leave_on_fable_limit", False),
+        "state": state_value,
+        "status_word": _STATUS_WORDS.get(state_value, state_value),
+        "usage_5h_percent": runtime.last_usage_percent if runtime is not None else None,
+        "usage_5h_resets_at": runtime.resets_at.isoformat() if runtime is not None and runtime.resets_at else None,
+        "usage_7d_percent": runtime.last_usage_percent_7d if runtime is not None else None,
+        "usage_7d_resets_at": runtime.resets_at_7d.isoformat() if runtime is not None and runtime.resets_at_7d else None,
+        # None means "assume the Anthropic default" (5h/7d), which is the
+        # case for oauth and api Profiles. Only a codex Profile's detected
+        # window duration overrides the assumed label.
+        "usage_window_label": _window_label_for_display(p, runtime, "window_label", "resets_at"),
+        "usage_window_label_7d": _window_label_for_display(p, runtime, "window_label_7d", "resets_at_7d"),
+        "tokens_total": usage.get("tokens", 0),
+        "cost_usd_total": usage.get("cost_usd"),
+        "in_use_now": in_use_now,
+        # Per-model weekly windows (e.g. Fable), from usage reads. Empty until
+        # one has run. The Fable one drives "leave when Fable is spent".
+        "model_usage": [
+            {"name": w.name, "percent": w.percent,
+             "resets_at": w.resets_at.isoformat() if w.resets_at else None,
+             "active": w.active}
+            for w in (runtime.model_usage if runtime is not None else ())
+        ],
+        # Prepaid Codex credits (issue #6). `credits_has` is None until a
+        # response has said anything about them — which is every oauth and api
+        # Profile, and a codex one whose backend does not report them — and
+        # that is deliberately not the same as false. `spending_on_credits`
+        # is true only while requests are actually being charged to them, so
+        # money is never spent without the UI saying so.
+        "credits_has": runtime.credits_has if runtime is not None else None,
+        "credits_balance": runtime.credits_balance if runtime is not None else None,
+        "spending_on_credits": spending_on_credits(runtime) if runtime is not None else False,
+    }
+
+
+def _merge_deleted_profiles(rows: list[dict], profiles) -> list[dict]:
+    """Collapse rows whose Profile no longer exists into a single entry.
+
+    Deleted accounts still hold spend, so dropping them would make the
+    breakdown disagree with the total beside it. But one row per dead id
+    renders as several identical "deleted profile" lines, which reads as a
+    bug — they are merged instead, and the count is named.
+    """
+    known = {p.id for p in profiles}
+    kept: list[dict] = []
+    gone: list[dict] = []
+    for row in rows:
+        if row.get("other") or row.get("key") in known:
+            kept.append(row)
+        else:
+            gone.append(row)
+    if not gone:
+        return kept
+    merged = {
+        "key": "__deleted__",
+        "cost_usd": round(sum(r.get("cost_usd") or 0 for r in gone), 6),
+        "tokens": sum(r.get("tokens") or 0 for r in gone),
+        "requests": sum(r.get("requests") or 0 for r in gone),
+        "share": round(sum(r.get("share") or 0 for r in gone), 1),
+        "label": f"{len(gone)} deleted profiles" if len(gone) > 1 else "deleted profile",
+        "kind": None,
+        "deleted": True,
+    }
+    kept.append(merged)
+    # Ranked by spend like every other row, so the merged entry lands where
+    # its size says it should rather than always at the bottom.
+    kept.sort(key=lambda r: (r.get("other") is True, -(r.get("cost_usd") or 0)))
+    return kept
+
+
+HUD_NAME = hud.HUD_NAME
+
+
+def _label_projects(rows: list) -> list:
+    """Statistics names a project the way the Overview does. The rows carry
+    Claude Code's sanitized folder id (`-Users-you-Work-app`); without a label
+    the page printed that raw — a full local path, in a screen people share."""
+    for row in rows:
+        if row.get("key") and not row.get("other"):
+            row["label"] = project_attribution.display_name(row["key"])
+    return rows
+
+
+def _widget_bundle() -> Path:
+    """Where the HUD is installed.
+
+    Falls back to the bundle it was installed as before the rename, so the
+    Dashboard's button keeps working for someone whose install predates it."""
+    current = hud.BUNDLE_DIR / hud.BUNDLE_NAME
+    return hud.LEGACY_BUNDLE if not current.is_dir() and hud.LEGACY_BUNDLE.is_dir() else current
+
+
+def _widget_state() -> dict:
+    """What the Dashboard needs to decide whether to offer the reopen button.
+
+    macOS only, and only when the bundle is actually installed — offering a
+    button that cannot work is worse than not offering one.
+    """
+    if sys.platform != "darwin":
+        return {"supported": False, "installed": False, "running": False}
+    bundle = _widget_bundle()
+    running = False
+    try:
+        # pgrep -f, not pkill: this only ever reads.
+        running = subprocess.run(["pgrep", "-f", f"{bundle}/Contents/MacOS/"],
+                                 capture_output=True, timeout=4).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        running = False
+    return {"supported": True, "installed": bundle.is_dir(), "running": running}
+
+
+# ---- proxy responses -------------------------------------------------------
+# A streaming request whose upstream has not answered after this long gets
+# headers and SSE pings straight away (see _DashboardHandler._serve_with_keepalive).
+# Claude Code's own first-byte window is 3 minutes; 10 seconds keeps every
+# ordinary request on the untouched fast path.
+_KEEPALIVE_AFTER_SECONDS = 10.0
+_KEEPALIVE_INTERVAL_SECONDS = 10.0
+_SSE_PING = b'event: ping\ndata: {"type": "ping"}\n\n'
+
+_FORCED_PROFILE_ERROR_MESSAGES = {
+    "forced_profile_missing": "[claude-unlimited] The Profile this session is pinned to no longer exists.",
+    "forced_profile_disabled": "[claude-unlimited] The Profile this session is pinned to is disabled.",
+    "forced_profile_needs_reauth": "[claude-unlimited] The Profile this session is pinned to needs re-authentication.",
+    "upstream_unreachable": "[claude-unlimited] Could not reach Anthropic for the Profile this session is pinned to.",
+}
+
+
+def _wants_event_stream(method: str, path: str, body: bytes) -> bool:
+    """A /v1/messages call that asked for SSE — the only kind a keep-alive
+    can be written into. Parsed, not pattern-matched: '"stream": true' can
+    just as well be text inside a message."""
+    if method != "POST" or not path.split("?", 1)[0].rstrip("/").endswith("/v1/messages") or not body:
+        return False
+    try:
+        return json.loads(body).get("stream") is True
+    except (ValueError, AttributeError):
+        return False
+
+
+def _proxy_error_payload(result) -> tuple:
+    """(status, Anthropic error envelope) for a request the gateway refused."""
+    message = (
+        # What the gateway worked out (which accounts, when the first one
+        # comes back), when it knows more than the code alone.
+        result.error_detail
+        or ("[claude-unlimited] The request body is too large to forward."
+            if result.error == "bad_request"
+            else _FORCED_PROFILE_ERROR_MESSAGES.get(
+                result.error, "[claude-unlimited] No eligible Profile is available right now."))
+    )
+    if result.error == "request_exceeds_every_window":
+        # The capacity guard's "prompt is too long" (docs/adr/0009): Claude
+        # Code's reactive compaction keys on the exact Anthropic envelope and
+        # wording, so it is relayed RAW — invalid_request_error, no
+        # [claude-unlimited] prefix.
+        error_type = "invalid_request_error"
+    else:
+        error_type = "overloaded_error" if result.status == 503 else "api_error"
+    return result.status, {"type": "error", "error": {"type": error_type, "message": message}}
+
+
+def _upstream_error_payload(result) -> dict:
+    """An upstream's own non-200 answer, as an SSE `error` event body. The
+    provider's envelope is kept when it is one (a 529 stays overloaded_error,
+    a context overflow stays invalid_request_error), so the client reacts to
+    it exactly as it would on a direct connection."""
+    raw = b""
+    try:
+        raw = b"".join(result.body_chunks or [])
+    except (OSError, ValueError):
+        pass
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
+            return {"type": "error", "error": parsed["error"]}
+    except ValueError:
+        pass
+    error_type = "overloaded_error" if result.status in (503, 529) else "api_error"
+    text = raw.decode("utf-8", "replace").strip()[:500] or f"HTTP {result.status}"
+    return {"type": "error", "error": {"type": error_type, "message": text}}
+
+
+def _discard_result(result) -> None:
+    """Close a gateway result nobody will read. Its body generator's cleanup
+    is what releases the Profile's in-flight slot and upstream connection."""
+    close = getattr(getattr(result, "body_chunks", None), "close", None)
+    if close is not None:
+        try:
+            close()
+        except Exception:  # noqa: BLE001 - cleanup must not raise
+            pass
+
+
+class _DashboardHandler(BaseHTTPRequestHandler):
+    server_version = "ClaudeUnlimited/0.1"
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A002 - stdlib signature
+        # Never log request paths, headers or bodies: they can contain
+        # profile names and base URLs, which are treated as sensitive.
+        pass
+
+    # ---- shared request handling ----
+
+    def _send_json(self, status: int, payload, *, extra_headers: Optional[dict] = None) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        for k, v in _security_headers().items():
+            self.send_header(k, v)
+        # e.g. Retry-After on a "no capacity" rejection, so a client that
+        # honours it waits for the quota window instead of retrying at once.
+        for k, v in (extra_headers or {}).items():
+            self.send_header(k, v)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_raw_json(self, status: int, body: bytes, *, download_name: str | None = None) -> None:
+        """Like _send_json, but for an already-serialized byte body (an
+        export bundle) rather than an object to json.dumps."""
+        self.send_response(status)
+        for k, v in _security_headers().items():
+            self.send_header(k, v)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        if download_name:
+            self.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _reject_bad_host(self) -> bool:
+        host_header = (self.headers.get("Host") or "").split(":")[0]
+        if host_header not in ALLOWED_HOST_NAMES:
+            self._send_json(400, {"error": "invalid_host", "message": "Host header not recognized."})
+            return True
+        return False
+
+    def _read_json_body(self, max_bytes: int = 1_000_000):
+        length = int(self.headers.get("Content-Length", 0))
+        if length <= 0:
+            return {}
+        if length > max_bytes:
+            raise ValueError("request body too large")
+        raw = self.rfile.read(length)
+        return json.loads(raw.decode("utf-8"))
+
+    def _check_csrf(self) -> bool:
+        token = self.headers.get("X-CSRF-Token", "")
+        if not secrets.compare_digest(token, _CSRF_TOKEN):
+            self._send_json(403, {"error": "csrf", "message": "Missing or invalid X-CSRF-Token header."})
+            return False
+        return True
+
+    # ---- routes ----
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self._reject_bad_host():
+            return
+        path = urlparse(self.path).path
+
+        if path == "/health":
+            self._send_json(200, {"status": "ok", "version": __version__})
+            return
+
+        if (path.rstrip("/") or "/") in _VIEW_ROUTES:
+            html = _INDEX_HTML.replace("__CSRF_TOKEN__", _CSRF_TOKEN)
+            body = html.encode("utf-8")
+            self.send_response(200)
+            for k, v in _security_headers().items():
+                self.send_header(k, v)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if path in ("/vendor/charts.js", "/vendor/charts.css"):
+            is_js = path.endswith(".js")
+            body = (_CHARTS_JS if is_js else _CHARTS_CSS).encode("utf-8")
+            self.send_response(200)
+            for k, v in _security_headers().items():
+                self.send_header(k, v)
+            self.send_header("Content-Type",
+                             "application/javascript; charset=utf-8" if is_js
+                             else "text/css; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if path == "/app.js":
+            body = _APP_JS.encode("utf-8")
+            self.send_response(200)
+            for k, v in _security_headers().items():
+                self.send_header(k, v)
+            self.send_header("Content-Type", "application/javascript; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if path == "/favicon.svg":
+            body = _FAVICON_SVG.encode("utf-8")
+            self.send_response(200)
+            for k, v in _security_headers().items():
+                self.send_header(k, v)
+            self.send_header("Content-Type", "image/svg+xml")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if path == "/api/update":
+            self._send_json(200, _public_update_state())
+            return
+
+        if path == "/api/status":
+            with _gateway._lock:
+                current_profile_id = _gateway._current_profile_id
+            pool = load_pool()
+            current_profile = pool.get(current_profile_id) if current_profile_id else None
+            self._send_json(200, {
+                "status": "ok",
+                "version": __version__,
+                "csrf_token": _CSRF_TOKEN,
+                "default_switch_threshold": DEFAULT_SWITCH_THRESHOLD,
+                "uptime_seconds": (datetime.now(timezone.utc) - _DAEMON_STARTED_AT).total_seconds(),
+                "current_profile_id": current_profile_id,
+                "current_profile_name": current_profile.name if current_profile is not None else None,
+                # Branch-routed agents never move current_profile_id; this is
+                # what they are actually on (profile id -> live agents).
+                "live_agents": _gateway.live_agent_counts(),
+                # Issue #3: `in_use_now` on /api/profiles is smoothed by a
+                # 15-minute grace so the Dashboard light does not flicker, so
+                # scripts using it as an idle signal see a false busy. These
+                # two are the unsmoothed truth: how long the whole pool has
+                # been idle (null = nothing served since this daemon started)
+                # and whether a request is open right now.
+                "idle_seconds": _gateway.seconds_since_last_activity(),
+                "serving_now": sorted(_gateway.serving_now_ids()),
+            })
+            return
+
+        if path == "/api/profiles":
+            runtime_map = _gateway.runtime_snapshot()
+            # Aggregated in SQL, not by loading the table: the Dashboard polls
+            # this once a second and the table grows forever.
+            usage_map = usage_history.totals_by_profile()
+            in_flight = _gateway.in_flight_ids()
+            items = [_profile_to_public_dict(p, runtime_map.get(p.id), usage_map.get(p.id), p.id in in_flight)
+                     for p in profile_repo.list_profiles()]
+            live_agents = _gateway.live_agent_counts()
+            on_account = _gateway.agents_on_account_seconds()
+            last_use = usage_history.latest_by_profile()
+            now_utc = datetime.now(timezone.utc)
+            for item in items:
+                item["live_agents"] = live_agents.get(item["id"], 0)
+                # The widget's "serving now" block. last_* is the latest
+                # COMPLETED request (usage is recorded once known), so it is
+                # labelled as the latest, never as what is running this second.
+                last = last_use.get(item["id"]) or {}
+                item["last_model"] = last.get("model")
+                item["last_requested_model"] = last.get("requested_model")
+                item["last_used_at"] = last.get("at")
+                item["last_project"] = (project_attribution.display_name(last["project_id"])
+                                        if last.get("project_id") else None)
+                seconds = on_account.get(item["id"])
+                item["agents_since"] = ((now_utc - timedelta(seconds=seconds)).isoformat()
+                                        if seconds is not None else None)
+            self._send_json(200, {"profiles": items})
+            return
+
+        if path == "/api/codex/model-map":
+            # Served rather than restated in the page: the Dashboard used to
+            # carry its own copy of this table, which went stale the first
+            # time the mapping changed.
+            self._send_json(200, {
+                # The saved parity list, normalized to full rows (defaults when
+                # unset) — the editable table AND exactly what /model advertises.
+                "mapping": openai_models.automatic_mapping(load_pool().settings.model_parity),
+                "selectable_models": openai_models.selectable_models(),        # OpenAI dropdown, cost desc
+                "claude_selectable_models": openai_models.selectable_claude_models(),  # Claude dropdown, cost desc
+                "reasoning_efforts": list(openai_models.VALID_REASONING_EFFORTS),     # Codex side
+                "claude_efforts": list(openai_models.CLAUDE_REASONING_EFFORTS),       # Claude side
+                "defaults": openai_models.default_parity_rows(),  # for [+] prefill / Reset preview
+                # Claude models the catalogue knows but the saved list does
+                # not offer — the "a new model shipped, decide what it costs
+                # you" signal the Dashboard raises a banner for.
+                "unmapped": openai_models.unmapped_claude_models(load_pool().settings.model_parity),
+            })
+            return
+
+        if path == "/api/branch-pins":
+            # Which agent sits on which account. gateway already keeps this as
+            # a read-only view (TTL-filtered); it had no consumer until now, so
+            # the Dashboard could only show a COUNT of live agents and never
+            # which branch was where.
+            pins = _gateway.branch_pins()
+            pool = load_pool()
+            names = {p.id: p.name for p in pool.profiles}
+            for pin in pins:
+                pin["profile_name"] = names.get(pin["profile_id"], "deleted profile")
+                # Claude Code names every subagent with x-claude-code-agent-id
+                # and sends a parent id only for a NESTED one, so the parent
+                # cannot be the test: that marked every direct subagent as a
+                # main agent. The agent id is (MAIN_BRANCH = the one you type at).
+                pin["is_subagent"] = pin.get("agent_id") != project_attribution.MAIN_BRANCH
+            self._send_json(200, {"pins": pins})
+            return
+
+        if path == "/api/widget":
+            self._send_json(200, _widget_state())
+            return
+
+        if path == "/api/settings":
+            pool = load_pool()
+            self._send_json(200, {
+                "settings": asdict(pool.settings),
+                # Why a session launched right now would, or would not, get the
+                # full context window. The real decision happens inside
+                # `cu code`, in another process; this is the same pure function
+                # run over the same pool so the dashboard can answer "why am I
+                # still on 200K?" without the user having to launch anything.
+                "context_1m_preview": _context_1m_preview(pool),
+            })
+            return
+
+        if path == "/api/locales":
+            pool = load_pool()
+            self._send_json(200, {
+                "available": i18n.list_locales(),
+                "names": i18n.locale_display_names(),
+                "current": pool.settings.language,
+            })
+            return
+
+        if path.startswith("/api/locales/"):
+            code = path.removeprefix("/api/locales/")
+            try:
+                self._send_json(200, {"language": code, "strings": i18n.load_locale(code)})
+            except i18n.UnknownLocaleError as exc:
+                self._send_json(404, {"error": "unknown_locale", "message": str(exc)})
+            return
+
+        if path == "/api/service":
+            self._send_json(200, daemon_installer.status())
+            return
+
+        if path == "/api/process":
+            self._send_json(200, _process_stats())
+            return
+
+        if path == "/api/placeholder-token":
+            self._send_json(200, {"token": placeholder_token.get_or_create()})
+            return
+
+        if path == "/api/session-token":
+            # A GET, not a POST: it must be callable from
+            # `claude-unlimited code`, a CLI process with no CSRF token to
+            # present, like /api/placeholder-token above. get_or_create()
+            # reuses a live token for the same profile_id instead of minting
+            # one per call, so this stays an idempotent lookup.
+            qs = parse_qs(urlparse(self.path).query)
+            # `mode=distribute` is the alternative to pinning: the session
+            # spreads its branches (main agent + each subagent) across
+            # accounts instead of being tied to one Profile.
+            if qs.get("mode", [None])[0] == "distribute":
+                self._send_json(200, {"token": session_tokens.get_or_create_distribute()})
+                return
+            profile_id = qs.get("profile_id", [None])[0]
+            if not profile_id:
+                self._send_json(400, {"error": "bad_request",
+                                       "message": "profile_id or mode=distribute is required."})
+                return
+            profile = next((p for p in profile_repo.list_profiles() if p.id == profile_id), None)
+            if profile is None:
+                self._send_json(404, {"error": "not_found", "message": "No profile with that id."})
+                return
+            if not profile.enabled:
+                self._send_json(400, {"error": "disabled", "message": "This profile is disabled — enable it first."})
+                return
+            self._send_json(200, {"token": session_tokens.get_or_create(profile_id)})
+            return
+
+        if path == "/api/usage/projects":
+            counts = project_usage.get_counts()
+            total = sum(counts.values())
+            token_totals = usage_history.totals_by_project()
+            items = [
+                {
+                    "project_id": pid,
+                    "display_name": project_attribution.display_name(pid),
+                    "requests": count,
+                    "percent": round(count / total * 100, 1) if total else 0,
+                    "tokens": token_totals.get(pid, {}).get("tokens", 0),
+                    "cost_usd": token_totals.get(pid, {}).get("cost_usd"),
+                }
+                for pid, count in sorted(counts.items(), key=lambda kv: -kv[1])
+            ]
+            self._send_json(200, {"projects": items, "total_requests": total})
+            return
+
+        if path == "/api/usage/stats":
+            qs = parse_qs(urlparse(self.path).query)
+            range_key = qs.get("range", [None])[0]
+            if range_key not in usage_history.RANGE_KEYS:
+                range_key = "1m"
+            ranged = usage_history.aggregated_since(range_key)
+            # The line chart carries more points than the bar-based summary.
+            granularity = usage_history.CHART_GRANULARITY[range_key]
+            if granularity == "hour":
+                buckets = usage_history.hourly_totals(ranged, bucket_hours=1)
+            elif granularity == "week":
+                # Enough weeks to span the whole range, or the chart silently
+                # covers less time than the total printed next to it.
+                days = usage_history.RANGE_TO_SPAN_DAYS.get(range_key, 30)
+                buckets = usage_history.weekly_totals(ranged, weeks=max(1, -(-days // 7)))
+            elif granularity == "month":
+                buckets = usage_history.monthly_totals(
+                    ranged, months=usage_history.months_to_cover(ranged, range_key))
+            else:
+                buckets = usage_history.daily_totals(ranged, days=usage_history.CHART_TO_DAYS.get(range_key, 30))
+            profiles_by_id = {p.id: p for p in profile_repo.list_profiles()}
+            by_profile = usage_history.split_by(ranged, "profile")
+            by_profile = _merge_deleted_profiles(by_profile, load_pool().profiles)
+            for row in by_profile:
+                profile = profiles_by_id.get(row["key"])
+                # An append-only log still holds rows for a deleted Profile;
+                # name it plainly rather than showing a bare internal id.
+                if row.get("deleted"):
+                    # Already named by _merge_deleted_profiles, which knows how
+                    # many ids it folded together; relabelling would discard
+                    # that count and print a bare "deleted profile".
+                    continue
+                row["label"] = profile.name if profile else ("Other" if row.get("other") else "deleted profile")
+                row["kind"] = profile.kind if profile else None
+            self._send_json(200, {
+                "range": range_key,
+                "granularity": granularity,
+                # One cost line per provider kind, sharing the bucket x-axis.
+                "series": usage_history.series_by_kind(
+                    ranged, buckets,
+                    {p.id: p.kind for p in load_pool().profiles}),
+                "totals": usage_history.totals(ranged),
+                "buckets": buckets,
+                "by_model": usage_history.split_by(ranged, "model"),
+                "by_project": _label_projects(usage_history.split_by(ranged, "project")),
+                "by_profile": by_profile,
+                "by_requested_model": usage_history.split_by(ranged, "requested_model"),
+                # What ECO saved in this range. Carries its own "never ran"
+                # signal so the UI never prints "$0.00 saved" for a feature
+                # that was simply switched off.
+                "eco": usage_history.eco_totals(ranged),
+                "speech": usage_history.speech_totals(ranged),
+                # Calls per day for the activity heatmap. Always a day grid,
+                # independent of the chart's granularity: a heatmap of weeks
+                # or months is not a heatmap.
+                "days": usage_history.daily_totals(
+                    ranged, days=min(usage_history.RANGE_TO_SPAN_DAYS.get(range_key, 30), 182)),
+                "history_begins": usage_history.history_begins_at(),
+            })
+            return
+
+        if path == "/api/usage/summary":
+            qs = parse_qs(urlparse(self.path).query)
+            range_key = qs.get("range", [None])[0]
+            if range_key not in usage_history.RANGE_KEYS:
+                range_key = "1w"
+            granularity = usage_history.RANGE_GRANULARITY[range_key]
+            ranged_events = usage_history.aggregated_since(range_key)
+            bucket_hours = 6  # 4 bars over the last 24h; 24 one-hour bars is too dense for the card
+            if granularity == "hour":
+                chart_totals = usage_history.hourly_totals(ranged_events, bucket_hours=bucket_hours)
+            elif granularity == "week":
+                chart_totals = usage_history.weekly_totals(ranged_events)
+            elif granularity == "month":
+                chart_totals = usage_history.monthly_totals(ranged_events)
+            else:
+                default_days = usage_history.RANGE_TO_DAYS[range_key]
+                days = _qs_int(qs, "days", default_days, minimum=1, maximum=31)
+                chart_totals = usage_history.daily_totals(ranged_events, days=days)
+            profiles_by_id = {p.id: p for p in profile_repo.list_profiles()}
+            by_profile_days = _qs_int(qs, "days", 7, minimum=1, maximum=31)
+            by_profile_totals = usage_history.daily_totals_by_profile(
+                usage_history.aggregated_in_last_days(by_profile_days), days=by_profile_days)
+            # usage_history is append-only, so it still carries entries for
+            # a deleted Profile's id. Drop anything that isn't a current
+            # Profile so the chart never shows a bare internal id.
+            for bucket in by_profile_totals:
+                bucket["profiles"] = {pid: tok for pid, tok in bucket["profiles"].items() if pid in profiles_by_id}
+            self._send_json(200, {
+                "range": range_key,
+                "granularity": granularity,
+                "bucket_hours": bucket_hours if granularity == "hour" else None,
+                "daily_totals": chart_totals,
+                "daily_totals_by_profile": by_profile_totals,
+                "profile_colors": {pid: p.tag_color for pid, p in profiles_by_id.items() if p.tag_color},
+                "profile_names": {pid: p.name for pid, p in profiles_by_id.items()},
+                "model_split": usage_history.model_split(ranged_events),
+                "hourly_histogram": usage_history.hourly_histogram(ranged_events),
+                "cost_by_profile": usage_history.cost_by_profile(ranged_events),
+                "total_events": usage_history.event_count(),
+                "pricing_source": pricing.PRICING_SOURCE,
+                "pricing_fetched": pricing.PRICING_FETCHED,
+            })
+            return
+
+        if path == "/api/activity":
+            qs = parse_qs(urlparse(self.path).query)
+            limit = _qs_int(qs, "limit", 200, minimum=1, maximum=1000)
+            category = qs.get("category", [None])[0]
+            since = qs.get("since", [None])[0]
+            until = qs.get("until", [None])[0]
+            events = activity.list_events(limit=limit, category=category, since=since, until=until)
+            self._send_json(200, {"events": [asdict(e) for e in events]})
+            return
+
+        if path == "/api/activity/export":
+            qs = parse_qs(urlparse(self.path).query)
+            category = qs.get("category", [None])[0]
+            since = qs.get("since", [None])[0]
+            until = qs.get("until", [None])[0]
+            events = activity.list_events(limit=activity.MAX_EVENTS, category=category, since=since, until=until)
+            body = json.dumps({"events": [asdict(e) for e in events]}, indent=2).encode("utf-8")
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            self._send_raw_json(200, body, download_name=f"claude-unlimited-activity-{stamp}.json")
+            return
+
+        # Anything left that isn't a Dashboard or static route is an
+        # upstream API path, the same rule do_POST uses. Claude Code issues
+        # GET /v1/models to build its `/model` picker; a 404 here makes the
+        # client fall back to its built-in Claude list, so the proxy path
+        # answers it per active Profile instead.
+        if not path.startswith("/api/"):
+            self._handle_proxy_request("GET", path)
+            return
+
+        self.send_response(404)
+        for k, v in _security_headers().items():
+            self.send_header(k, v)
+        self.end_headers()
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self._reject_bad_host():
+            return
+        path = urlparse(self.path).path
+
+        if not path.startswith("/api/"):
+            self._handle_proxy_request("POST", path)
+            return
+
+        if path == "/api/models/refresh":
+            # CSRF-exempt like GET /api/session-token above: fired by
+            # `claude-unlimited code` at session launch, a CLI process with
+            # no CSRF token to present. Safe without one: it takes no input,
+            # changes no user-visible state, and the refresh it schedules is
+            # throttled (one sha check per 5 min) and backed off hard in
+            # model_catalogue, so the worst a forged cross-site POST can do
+            # is a catalogue check that was about to happen anyway. The
+            # thread returns this response immediately — a `code` launch
+            # must never wait on GitHub.
+            threading.Thread(target=model_catalogue.refresh_if_allowed,
+                             daemon=True, name="model-catalogue-session-refresh").start()
+            self._send_json(202, {"status": "scheduled"})
+            return
+
+        if not self._check_csrf():
+            return
+
+        if path == "/api/widget/launch":
+            # Reopens the HUD after it was closed or quit. Launches
+            # ONE fixed local bundle with no caller-supplied input, so there is
+            # nothing here for a request to redirect at something else.
+            state = _widget_state()
+            if not state["supported"]:
+                self._send_json(400, {"error": "unsupported",
+                                      "message": f"{HUD_NAME} is macOS only."})
+                return
+            if not state["installed"]:
+                self._send_json(404, {"error": "not_installed",
+                                      "message": f"{HUD_NAME}.app is not installed."})
+                return
+            try:
+                subprocess.run(["open", "-a", str(_widget_bundle())],
+                               capture_output=True, timeout=10, check=True)
+            except (OSError, subprocess.SubprocessError) as exc:
+                self._send_json(500, {"error": "launch_failed", "message": str(exc)})
+                return
+            self._send_json(200, {"launched": True})
+            return
+
+        if path == "/api/presence":
+            # Real Dashboard input (app.js notePresence, at most once a minute).
+            # Keeps background usage checks running while someone is here.
+            _note_user_activity()
+            self._send_json(200, {"active": True})
+            return
+
+        if path == "/api/profiles":
+            try:
+                body = self._read_json_body()
+                credential = body.pop("credential", "")
+                if body.get("kind") == "oauth" and not body.get("account_uuid"):
+                    # Resolve the account uuid from Anthropic directly
+                    # rather than asking for a value nobody can look up.
+                    try:
+                        account = anthropic_oauth.fetch_account_profile(credential)
+                    except anthropic_oauth.ProfileLookupError as exc:
+                        # Recorded server-side too, so the failure leaves a
+                        # trace beyond the browser toast that shows it.
+                        activity.record("error", "Add Profile failed — could not resolve account", meta=str(exc)[:200])
+                        self._send_json(400, {"error": "profile_lookup", "message": str(exc)})
+                        return
+                    body["account_uuid"] = account.account_uuid
+                    body["plan"] = anthropic_oauth.plan_from_account(account)
+
+                existing = profile_repo.find_by_account_uuid(body["account_uuid"]) if body.get("kind") == "oauth" and body.get("account_uuid") else None
+                if existing is not None:
+                    profile_repo.update_credential(existing.id, credential)
+                    if "plan" in body:
+                        existing = profile_repo.update_profile(existing.id, plan=body["plan"])
+                    self._send_json(200, {"profile": _profile_to_public_dict(existing), "reused_existing": True})
+                    return
+
+                p = profile_repo.create_profile(credential=credential, **body)
+                self._send_json(201, {"profile": _profile_to_public_dict(p)})
+                # Populate usage now rather than leaving the card blank until
+                # this account happens to serve a request.
+                _prime_profile_async(p.id)
+            except profile_repo.ValidationError as exc:
+                activity.record("error", "Add Profile failed — validation", meta=str(exc)[:200])
+                self._send_json(400, {"error": "validation", "message": str(exc)})
+            except profile_repo.ProfileRepositoryError as exc:
+                activity.record("error", "Add Profile failed", meta=str(exc)[:200])
+                self._send_json(500, {"error": "repository", "message": str(exc)})
+            except (ValueError, TypeError) as exc:
+                activity.record("error", "Add Profile failed — bad request", meta=str(exc)[:200])
+                self._send_json(400, {"error": "bad_request", "message": str(exc)})
+            return
+
+        if path.startswith("/api/profiles/") and path.endswith("/take-over"):
+            profile_id = path.removeprefix("/api/profiles/").removesuffix("/take-over")
+            profile = profile_repo.list_profiles()
+            profile = next((p for p in profile if p.id == profile_id), None)
+            if profile is None:
+                self._send_json(404, {"error": "not_found", "message": "No profile with that id."})
+                return
+            if not profile.enabled:
+                self._send_json(400, {"error": "disabled",
+                                       "message": "Enable this Profile first — Take over doesn't re-enable it."})
+                return
+            _gateway.force_active(profile_id)
+            runtime_map = _gateway.runtime_snapshot()
+            self._send_json(200, {"profile": _profile_to_public_dict(profile, runtime_map.get(profile_id))})
+            return
+
+        if path.startswith("/api/profiles/") and path.endswith("/credential"):
+            # A separate route rather than a PATCH /api/profiles/<id> field,
+            # because the secret lives in secret_store, not the Pool config
+            # JSON update_profile() writes. Lets the Dashboard rotate an API
+            # key or pasted OAuth token without re-adding the Profile.
+            profile_id = path.removeprefix("/api/profiles/").removesuffix("/credential")
+            if not any(p.id == profile_id for p in profile_repo.list_profiles()):
+                # update_credential() doesn't check this: it would write an
+                # orphaned secret for an unknown id and no-op the config
+                # update. Checked here so an unknown id gets a clear 404.
+                self._send_json(404, {"error": "not_found", "message": "No profile with that id."})
+                return
+            try:
+                body = self._read_json_body()
+                credential = body.get("credential", "")
+                # Records its own "<name> credential refreshed" activity
+                # entry, so there is nothing else to log here.
+                profile_repo.update_credential(profile_id, credential)
+            except profile_repo.ValidationError as exc:
+                self._send_json(400, {"error": "validation", "message": str(exc)})
+                return
+            except (ValueError, TypeError) as exc:
+                self._send_json(400, {"error": "bad_request", "message": str(exc)})
+                return
+            self._send_json(200, {"ok": True})
+            return
+
+        if path == "/api/import-claude-code":
+            try:
+                imported = anthropic_oauth.read_claude_code_credentials()
+                account = anthropic_oauth.fetch_account_profile(imported.access_token)
+                name = account.email or "Imported Claude account"
+                plan = anthropic_oauth.plan_from_account(account)
+
+                # Also refreshes a Profile whose plan has changed: this flow
+                # already re-fetches the account, so keeping plan current is
+                # free.
+                profile_out, reused = profile_repo.upsert_oauth_profile(
+                    name=name, account_uuid=account.account_uuid, credential=imported.access_token,
+                    plan=plan, refresh_token=imported.refresh_token, expires_at=imported.expires_at,
+                )
+                status = 200 if reused else 201
+                if not reused:
+                    _prime_profile_async(profile_out.id)
+
+                self._send_json(status, {"profile": _profile_to_public_dict(profile_out), "reused_existing": reused, "account": {
+                    "email": account.email, "org_name": account.org_name,
+                    "has_claude_max": account.has_claude_max, "has_claude_pro": account.has_claude_pro,
+                }})
+            except anthropic_oauth.CredentialImportError as exc:
+                activity.record("error", "Import current login failed — no local session found", meta=str(exc)[:200])
+                self._send_json(404, {"error": "no_local_login", "message": str(exc)})
+            except anthropic_oauth.ProfileLookupError as exc:
+                activity.record("error", "Import current login failed — could not resolve account", meta=str(exc)[:200])
+                self._send_json(502, {"error": "profile_lookup", "message": str(exc)})
+            except profile_repo.ValidationError as exc:
+                activity.record("error", "Import current login failed — validation", meta=str(exc)[:200])
+                self._send_json(400, {"error": "validation", "message": str(exc)})
+            except profile_repo.ProfileRepositoryError as exc:
+                activity.record("error", "Import current login failed", meta=str(exc)[:200])
+                self._send_json(500, {"error": "repository", "message": str(exc)})
+            return
+
+        if path == "/api/reset":
+            count = profile_repo.reset_all_profiles()
+            self._send_json(200, {"removed": count})
+            return
+
+        if path == "/api/service/install":
+            try:
+                body = self._read_json_body()
+                port = int(body.get("port", DEFAULT_PORT))
+                daemon_installer.install(port)
+                activity.record("config", "Registered to start automatically on login", meta=f"port {port}")
+                self._send_json(200, daemon_installer.status())
+            except daemon_installer.DaemonInstallerError as exc:
+                self._send_json(500, {"error": "install_failed", "message": str(exc)})
+            except (ValueError, TypeError) as exc:
+                self._send_json(400, {"error": "bad_request", "message": str(exc)})
+            return
+
+        if path == "/api/service/uninstall":
+            try:
+                daemon_installer.uninstall()
+                activity.record("config", "No longer starts automatically on login")
+                self._send_json(200, daemon_installer.status())
+            except daemon_installer.DaemonInstallerError as exc:
+                self._send_json(500, {"error": "uninstall_failed", "message": str(exc)})
+            return
+
+        if path == "/api/process/kill":
+            # Respond before acting: the client must have the confirmation
+            # in hand before this process can go away.
+            service = daemon_installer.status()
+            self._send_json(200, {"killed": True, "was_service": service["installed"]})
+
+            def _do_kill() -> None:
+                # Same reason as restart: whatever starts this daemon next
+                # should come back showing what it showed before.
+                _gateway._persist()
+                if service["installed"]:
+                    try:
+                        daemon_installer.stop()
+                    except daemon_installer.DaemonInstallerError:
+                        pass
+                else:
+                    self.server.shutdown()
+
+            threading.Thread(target=_do_kill, daemon=True).start()
+            return
+
+        if path == "/api/update/check":
+            # Look only. Downloading or installing is the other endpoint, or
+            # the background policy.
+            self._send_json(200, _run_update_check(mode_override="manual"))
+            return
+
+        if path == "/api/update/install":
+            # Installs whatever the last check found, regardless of mode: this
+            # is an explicit click, not the background policy.
+            settings = load_pool().settings
+            # An explicit click may override the idle guard: the person
+            # pressing it can see their own sessions, and is choosing to
+            # accept the restart.
+            force = bool((self._read_json_body() or {}).get("force"))
+            if not force and not _gateway.is_idle(_UPDATE_IDLE_REQUIRED_SECONDS):
+                self._send_json(409, {
+                    "error": "sessions_active",
+                    "message": "A session used the pool recently. Installing now would "
+                               "require a restart and could interrupt it. Try again once "
+                               "things are idle, or stop the session first.",
+                })
+                return
+            outcome = updater.run_update_cycle(__version__, "auto_install")
+            _record_update_outcome(outcome, settings)
+            if outcome.error:
+                self._send_json(502, {"error": "update_failed", "message": outcome.error})
+                return
+            if outcome.action != "installed":
+                self._send_json(200, {"installed": False, "message": "Already up to date."})
+                return
+            # Respond before restarting: the client must have the answer in
+            # hand before this process goes away.
+            self._send_json(200, {"installed": True, "version": outcome.release.version,
+                                   "restarting": True})
+            threading.Thread(target=_restart_for_update, args=(self.server.server_address[1],),
+                              daemon=True).start()
+            return
+
+        if path == "/api/process/restart":
+            service = daemon_installer.status()
+            if not service["installed"]:
+                self._send_json(400, {
+                    "error": "not_installed",
+                    "message": "Can't restart a foreground daemon from itself — nothing would bring it back. "
+                               "Run `claude-unlimited install` first so it's managed as a background service.",
+                })
+                return
+            self._send_json(200, {"restarting": True})
+
+            def _do_restart() -> None:
+                # Snapshot first: the replacement process reads this back, so
+                # usage percentages and states survive rather than the
+                # Dashboard coming back blank.
+                _gateway._persist()
+                try:
+                    daemon_installer.start()  # atomic stop+start via the service manager
+                except daemon_installer.DaemonInstallerError:
+                    pass
+
+            threading.Thread(target=_do_restart, daemon=True).start()
+            return
+
+        if path == "/api/placeholder-token/regenerate":
+            token = placeholder_token.regenerate()
+            activity.record("config", "Placeholder token regenerated")
+            self._send_json(200, {"token": token})
+            return
+
+        if path.startswith("/api/profiles/") and path.endswith("/refresh"):
+            profile_id = path.removeprefix("/api/profiles/").removesuffix("/refresh")
+            profile = next((p for p in profile_repo.list_profiles() if p.id == profile_id), None)
+            if profile is None:
+                self._send_json(404, {"error": "not_found", "message": "No such profile."})
+                return
+            try:
+                # Synchronous, unlike the one on profile creation: this one was
+                # asked for, so the caller waits and gets the refreshed Profile
+                # back rather than having to guess when it landed.
+                result = connection_test.test_connection(
+                    profile_id, credential=_resolved_credential(profile))
+                _record_ping(profile, result)
+                # Report what actually happened. Announcing "fetched" after a
+                # 401 told people the account was fine while the Dashboard
+                # showed nothing new — the two together read as a broken
+                # feature rather than a dead credential.
+                if result.get("ok"):
+                    activity.record("session", f"Fetched info for {profile.name}",
+                                     meta=f"status={result.get('status')}")
+                else:
+                    activity.record("error", f"Couldn't fetch info for {profile.name}",
+                                     meta=f"status={result.get('status')}")
+            except connection_test.ConnectionTestThrottled as exc:
+                self._send_json(429, {"error": "throttled", "message": str(exc),
+                                       "retry_after_seconds": exc.retry_after_seconds})
+                return
+            except connection_test.ConnectionTestError as exc:
+                self._send_json(502, {"error": "unreachable", "message": str(exc)})
+                return
+            fresh = next((p for p in profile_repo.list_profiles() if p.id == profile_id), None)
+            runtime = _gateway.runtime_snapshot().get(profile_id)
+            self._send_json(200, {
+                "profile": _profile_to_public_dict(fresh or profile, runtime),
+                "ok": bool(result.get("ok")),
+                "status": result.get("status"),
+                "message": result.get("message"),
+            })
+            return
+
+        if path.startswith("/api/profiles/") and path.endswith("/test"):
+            profile_id = path.removeprefix("/api/profiles/").removesuffix("/test")
+            try:
+                _probe_profile = next((p for p in profile_repo.list_profiles() if p.id == profile_id), None)
+                result = connection_test.test_connection(
+                    profile_id,
+                    credential=_resolved_credential(_probe_profile) if _probe_profile else None)
+                # A test is a live request like any other: let it refresh the
+                # Profile's usage instead of throwing the headers away.
+                profile = next((p for p in profile_repo.list_profiles() if p.id == profile_id), None)
+                if profile is not None:
+                    _record_ping(profile, result)
+                result.pop("headers", None)  # upstream headers are not the browser's business
+                if result["ok"]:
+                    activity.record("session", "Connection test succeeded", meta=f"profile={profile_id}, {result['elapsed_ms']}ms")
+                else:
+                    activity.record("error", "Connection test failed", meta=f"profile={profile_id}, status={result['status']}")
+                self._send_json(200, result)
+            except connection_test.ConnectionTestError as exc:
+                self._send_json(502, {"ok": False, "error": "connection_test_failed", "message": str(exc)})
+            except connection_test.ConnectionTestThrottled as exc:
+                self._send_json(429, {"ok": False, "error": "connection_test_throttled", "message": str(exc),
+                                       "retry_after_seconds": exc.retry_after_seconds})
+            return
+
+        if path == "/api/notifications/test":
+            # send(), not send_macos_notification — the latter is a no-op off
+            # macOS, so the test button reported success while doing nothing on
+            # Linux and Windows.
+            notifications.send(
+                "Claude Unlimited", "This is a test notification — if you can see this, notifications are working.")
+            self._send_json(200, {"sent": True})
+            return
+
+        if path == "/api/export":
+            try:
+                body = self._read_json_body()
+                bundle = export_import.build_export_bundle(
+                    include_profiles=bool(body.get("include_profiles", False)),
+                    include_settings=bool(body.get("include_settings", False)),
+                    include_activity=bool(body.get("include_activity", False)),
+                    passphrase=body.get("passphrase") or None,
+                )
+                stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                self._send_raw_json(200, bundle, download_name=f"claude-unlimited-export-{stamp}.json")
+                activity.record("config", "Exported a bundle")
+            except export_import.ExportImportError as exc:
+                self._send_json(400, {"error": "export_failed", "message": str(exc)})
+            except (ValueError, TypeError) as exc:
+                self._send_json(400, {"error": "bad_request", "message": str(exc)})
+            return
+
+        if path == "/api/import/preview":
+            try:
+                body = self._read_json_body(max_bytes=8_000_000)
+                bundle = body.get("bundle", "")
+                parsed = export_import.import_bundle(bundle, passphrase=body.get("passphrase") or None)
+                self._send_json(200, {
+                    "profiles": [
+                        {"name": p.get("name"), "kind": p.get("kind"), "account_uuid": p.get("account_uuid")}
+                        for p in parsed.profiles
+                    ],
+                    "settings_included": parsed.settings is not None,
+                    "activity_count": len(parsed.activity) if parsed.activity else 0,
+                })
+            except export_import.WrongPassphraseError as exc:
+                self._send_json(401, {"error": "wrong_passphrase", "message": str(exc)})
+            except export_import.ExportImportError as exc:
+                self._send_json(400, {"error": "import_failed", "message": str(exc)})
+            except (ValueError, TypeError) as exc:
+                self._send_json(400, {"error": "bad_request", "message": str(exc)})
+            return
+
+        if path == "/api/import/apply":
+            try:
+                body = self._read_json_body(max_bytes=8_000_000)
+                bundle = body.get("bundle", "")
+                parsed = export_import.import_bundle(bundle, passphrase=body.get("passphrase") or None)
+                result = export_import.apply_import(
+                    parsed,
+                    import_profiles=bool(body.get("import_profiles", False)),
+                    import_settings=bool(body.get("import_settings", False)),
+                    conflict_strategy=body.get("conflict_strategy", "keep_existing"),
+                )
+                self._send_json(200, {"result": result})
+            except export_import.WrongPassphraseError as exc:
+                self._send_json(401, {"error": "wrong_passphrase", "message": str(exc)})
+            except export_import.ExportImportError as exc:
+                self._send_json(400, {"error": "import_failed", "message": str(exc)})
+            except (ValueError, TypeError) as exc:
+                self._send_json(400, {"error": "bad_request", "message": str(exc)})
+            return
+
+        self.send_response(404)
+        for k, v in _security_headers().items():
+            self.send_header(k, v)
+        self.end_headers()
+
+    def _check_placeholder_token(self) -> Optional[tuple]:
+        """None on rejection, having already sent the 401. Otherwise a
+        (SessionGrant,) tuple: the shared placeholder token grants nothing
+        special and normal Rotation applies, while a session_tokens-minted one
+        either pins the request to the Profile `--profile` asked for, or marks
+        the session as distributing its branches across accounts."""
+        auth = self.headers.get("Authorization", "")
+        presented = auth[len("Bearer "):] if auth.startswith("Bearer ") else auth
+        if placeholder_token.matches(presented):
+            return (session_tokens.SessionGrant(),)
+        grant = session_tokens.resolve_grant(presented)
+        if grant.forced_profile_id is not None or grant.distribute:
+            return (grant,)
+        self._send_json(401, {"type": "error", "error": {"type": "authentication_error",
+                                                           "message": "[claude-unlimited] invalid local credential"}})
+        return None
+
+    def _handle_proxy_request(self, method: str, path: str) -> None:
+        """Everything that isn't /health or /api/*: the live proxy path.
+
+        Gated by the placeholder token or a session token, never by CSRF:
+        Claude Code has no CSRF token, which is a Dashboard-browser
+        concept."""
+        _note_user_activity()
+
+        auth_result = self._check_placeholder_token()
+        if auth_result is None:
+            return
+        (grant,) = auth_result
+
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        body = self.rfile.read(length) if length > 0 else b""
+        inbound_headers = {k: v for k, v in self.headers.items()}
+
+        def serve():
+            return _gateway.handle(method, path, inbound_headers, body,
+                                   forced_profile_id=grant.forced_profile_id,
+                                   distribute=grant.distribute)
+
+        if _wants_event_stream(method, path, body):
+            self._serve_with_keepalive(serve)
+            return
+        self._write_proxy_result(serve())
+
+    def _write_proxy_result(self, result) -> None:
+        """The ordinary response: whatever the gateway decided, as-is."""
+        if result.error is not None:
+            status, payload = _proxy_error_payload(result)
+            self._send_json(status, payload, extra_headers=result.headers)
+            return
+
+        self.send_response(result.status)
+        for k, v in result.headers.items():
+            if k.lower() in ("connection", "transfer-encoding", "content-length"):
+                continue
+            self.send_header(k, v)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            for chunk in result.body_chunks:
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client disconnected mid-stream
+
+    def _serve_with_keepalive(self, serve) -> None:
+        """A streaming request whose upstream is slow to answer.
+
+        Claude Code gives up on a request that has sent no response headers
+        after its first-byte window (3 minutes here), shows "Waiting for API
+        response · will retry … check your network", and sends it again —
+        while the first one is still being worked on upstream. A long Opus
+        turn behind a busy API, or a local model's slow prefill, crosses that.
+
+        So the gateway runs in the background. If it answers within
+        _KEEPALIVE_AFTER_SECONDS nothing changes: the normal response goes
+        out. If not, 200 headers and an SSE `ping` go out straight away and
+        every _KEEPALIVE_INTERVAL_SECONDS after — the same keep-alive the
+        Anthropic API sends while a model thinks — until the real stream
+        starts. A failure that arrives after that goes out as an SSE `error`
+        event carrying the provider's own error, which the client handles
+        exactly like one received mid-stream."""
+        box: dict = {}
+        done = threading.Event()
+
+        def run():
+            try:
+                box["result"] = serve()
+            except BaseException as exc:  # noqa: BLE001 - re-raised or reported below
+                box["error"] = exc
+            finally:
+                done.set()
+
+        threading.Thread(target=run, daemon=True, name="proxy-keepalive").start()
+        if done.wait(_KEEPALIVE_AFTER_SECONDS):
+            if "error" in box:
+                raise box["error"]
+            self._write_proxy_result(box["result"])
+            return
+
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(_SSE_PING)
+            self.wfile.flush()
+            while not done.wait(_KEEPALIVE_INTERVAL_SECONDS):
+                self.wfile.write(_SSE_PING)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            # The client left. Let the upstream call finish, then release it:
+            # an unread body must still be closed, or its in-flight slot and
+            # connection are never freed.
+            done.wait()
+            _discard_result(box.get("result"))
+            return
+
+        if "error" in box:
+            self._write_sse_error("api_error", "[claude-unlimited] The request failed inside the proxy.")
+            raise box["error"]
+        result = box["result"]
+        try:
+            if result.error is not None:
+                _status, payload = _proxy_error_payload(result)
+                self._write_sse(b"error", payload)
+                return
+            if result.status != 200:
+                self._write_sse(b"error", _upstream_error_payload(result))
+                return
+            for chunk in result.body_chunks:
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            _discard_result(result)
+
+    def _write_sse(self, event: bytes, payload: dict) -> None:
+        self.wfile.write(b"event: " + event + b"\ndata: " + json.dumps(payload).encode("utf-8") + b"\n\n")
+        self.wfile.flush()
+
+    def _write_sse_error(self, error_type: str, message: str) -> None:
+        try:
+            self._write_sse(b"error", {"type": "error", "error": {"type": error_type, "message": message}})
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        if self._reject_bad_host() or not self._check_csrf():
+            return
+        path = urlparse(self.path).path
+        if path.startswith("/api/profiles/"):
+            profile_id = path.removeprefix("/api/profiles/")
+            try:
+                body = self._read_json_body()
+                before = next((x for x in profile_repo.list_profiles() if x.id == profile_id), None)
+                p = profile_repo.update_profile(profile_id, **body)
+                self._send_json(200, {"profile": _profile_to_public_dict(p)})
+                # Turning a Profile into a rotation candidate is the moment its
+                # usage starts mattering, and a Profile that has never served a
+                # request has none recorded. Only on the transition, so
+                # re-saving an already-automatic Profile costs nothing.
+                if _should_prime_after_update(before, p):
+                    _prime_profile_async(p.id)
+            except profile_repo.ValidationError as exc:
+                self._send_json(400, {"error": "validation", "message": str(exc)})
+            except profile_repo.ProfileRepositoryError as exc:
+                self._send_json(404, {"error": "not_found", "message": str(exc)})
+            except (ValueError, TypeError) as exc:
+                self._send_json(400, {"error": "bad_request", "message": str(exc)})
+            return
+
+        if path == "/api/settings":
+            try:
+                body = self._read_json_body()
+                s = update_settings(**body)
+                if "model_parity" in body:
+                    from . import openai_bridge
+                    openai_bridge.forget_model_substitutions()
+                self._send_json(200, {"settings": asdict(s)})
+            except ValueError as exc:
+                self._send_json(400, {"error": "validation", "message": str(exc)})
+            return
+
+        self.send_response(404)
+        for k, v in _security_headers().items():
+            self.send_header(k, v)
+        self.end_headers()
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        if self._reject_bad_host() or not self._check_csrf():
+            return
+        path = urlparse(self.path).path
+        if path.startswith("/api/profiles/"):
+            profile_id = path.removeprefix("/api/profiles/")
+            try:
+                profile_repo.delete_profile(profile_id)
+                self._send_json(204, None) if False else self._send_json(200, {"deleted": profile_id})
+            except profile_repo.ProfileRepositoryError as exc:
+                self._send_json(404, {"error": "not_found", "message": str(exc)})
+            return
+
+        self.send_response(404)
+        for k, v in _security_headers().items():
+            self.send_header(k, v)
+        self.end_headers()
+
+
+class _WindowsExclusiveHTTPServer(ThreadingHTTPServer):
+    """Windows-only: bind with SO_EXCLUSIVEADDRUSE so no other process can bind
+    our port alongside us. Never instantiated off Windows (the socket option
+    does not exist there); referencing the class is harmless."""
+
+    def server_bind(self):
+        import socket as _socket
+
+        opt = getattr(_socket, "SO_EXCLUSIVEADDRUSE", None)
+        if opt is not None:
+            self.socket.setsockopt(_socket.SOL_SOCKET, opt, 1)
+        super().server_bind()
+
+
+def make_server(host: str = LOOPBACK_HOST, port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        raise ValueError(
+            f"Refusing to bind to {host!r} — this daemon must only ever bind to a "
+            "loopback address."
+        )
+    # Rebuild the module-level Gateway on every call rather than only at
+    # import time. A daemon process calls make_server() once, so this
+    # changes nothing in production, but the test suite calls it many times
+    # per process. A Gateway built at import time would be constructed
+    # before any test fixture had patched APP_DIR, so it would load — and
+    # later write — the real ~/.claude-unlimited/runtime_state.json.
+    global _gateway
+    _gateway = Gateway()
+    # On Windows, SO_REUSEADDR does NOT mean "reuse a TIME_WAIT port" as it does
+    # on POSIX — it lets a SECOND socket bind a port already in active use,
+    # which is a hijack risk (another local process could bind 4317 alongside
+    # us and race for the placeholder token) and also defeats the EADDRINUSE
+    # conflict detection the CLI relies on. The correct Windows flag is
+    # SO_EXCLUSIVEADDRUSE. On POSIX we keep the stdlib default (reuse on).
+    if os.name == "nt":
+        _WindowsExclusiveHTTPServer.allow_reuse_address = False
+        server = _WindowsExclusiveHTTPServer((host, port), _DashboardHandler)
+    else:
+        server = ThreadingHTTPServer((host, port), _DashboardHandler)
+    _assert_bound_to_loopback(server)
+    # Remember the actually-bound port (port 0 resolves to a real one) so the
+    # background update loops can restart onto the SAME port — they have no
+    # request handler to read self.server.server_address from.
+    global _RUNNING_PORT
+    _RUNNING_PORT = server.server_address[1]
+    return server
+
+
+PID_FILE = APP_DIR / "daemon.pid"
+# The port this daemon is actually serving on, set by make_server(). Used by
+# the auto-update restart paths so a daemon on a non-default port relaunches
+# correctly instead of onto DEFAULT_PORT.
+_RUNNING_PORT = DEFAULT_PORT
+
+
+_OAUTH_REFRESH_LOOP_INTERVAL_SECONDS = 60
+# Background usage checks (usage_probe.py): who is due, idle gating, backoff.
+_usage_probe = usage_probe.Scheduler()
+_usage_probe_tick_lock = threading.Lock()
+_UPDATE_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
+_UPDATE_CHECK_STARTUP_DELAY_SECONDS = 120
+# An update replaces the running code and needs a restart to take effect, so
+# it must never land in the middle of someone's session. Nothing installs
+# until the pool has served nothing for this long.
+_UPDATE_IDLE_REQUIRED_SECONDS = 15 * 60
+# How often to re-check whether a downloaded update can finally be applied.
+_UPDATE_IDLE_RECHECK_SECONDS = 5 * 60
+
+# Last known update state, shown by GET /api/update. In memory only: a
+# restart should re-check rather than trust a stale verdict from a previous
+# process, and a check is cheap.
+_update_state: dict = {"checked_at": None, "available": None, "action": "none", "error": None}
+_update_lock = threading.Lock()
+
+
+def _record_update_outcome(outcome, settings) -> None:
+    release = outcome.release
+    with _update_lock:
+        _update_state.update({
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "available": None if release is None else {
+                "version": release.version, "tag": release.tag, "notes": release.notes[:4000],
+            },
+            "action": outcome.action,
+            "error": outcome.error,
+        })
+    # Both mean "nothing to tell the person about" and both carry no Release,
+    # so everything below — which dereferences one — must be skipped.
+    if outcome.action in ("none", "no_releases"):
+        return
+    if outcome.action == "installed":
+        activity.record("config", f"Updated to {release.version}", meta="restart to finish")
+        notifications.notify_if_enabled("update_available", "Claude Unlimited",
+                                          f"Updated to {release.version} — restart to finish.", settings)
+        return
+    activity.record("config", f"Update available: {release.version}", meta=outcome.action)
+    notifications.notify_if_enabled("update_available", "Claude Unlimited",
+                                      f"Version {release.version} is available.", settings)
+
+
+def _resolved_credential(profile):
+    """The bare access token to use for an out-of-band probe.
+
+    Routed through the Gateway on purpose: it owns the single per-Profile
+    refresh backoff clock, so refreshing here rather than in connection_test
+    avoids a second, competing refresh path."""
+    if profile is None or profile.kind != "oauth":
+        return None  # connection_test resolves these itself
+    try:
+        from . import secret_store
+        return _gateway._maybe_refresh_credential(profile, secret_store.get_token(profile.id))
+    except Exception:  # noqa: BLE001 - connection_test falls back to decoding what is stored
+        return None
+
+
+def _is_rotation_candidate(profile) -> bool:
+    """Whether the router could pick this Profile: both switches must be on."""
+    return bool(profile is not None and getattr(profile, "enabled", False)
+                and getattr(profile, "automatic", False))
+
+
+def _should_prime_after_update(before, after) -> bool:
+    """Whether a Profile edit is one that should refresh its usage.
+
+    The transition INTO being a rotation candidate — which needs `enabled` and
+    `automatic` together, not either alone. Keying on `automatic` by itself
+    missed the common case: turning auto-rotation on for a Profile that was
+    switched off did nothing, because priming refuses to ping a disabled
+    Profile, and switching it on later did not re-trigger. The card then stayed
+    blank until the account happened to serve a request.
+
+    Re-saving a Profile that was already a candidate must not spend a request."""
+    return _is_rotation_candidate(after) and not _is_rotation_candidate(before)
+
+
+def _record_ping(profile, result: dict, model_windows=None) -> None:
+    """Feeds a one-off ping's response into the same usage pipeline a real
+    request goes through, so the Dashboard reflects it immediately.
+
+    Best-effort: a Profile that cannot be reached is still a Profile, and the
+    next real request will populate it."""
+    from .observation import classify as classify_anthropic
+    from .gateway import _filter_openai_headers
+    from .proxy import filter_response_headers
+
+    from .observation import AuthInvalid, QuotaExhausted, UsageSnapshot
+
+    headers = result.get("headers") or {}
+    status = result.get("status")
+    if not status:
+        return
+
+    now = datetime.now(timezone.utc)
+    try:
+        if profile.kind == "codex":
+            observation = openai_observation.classify(status, _filter_openai_headers(headers), now)
+            # The plan a codex credential's JWT claims can disagree with what
+            # the backend reports; the header is the authority.
+            plan = {k.lower(): v for k, v in headers.items()}.get("x-codex-plan-type")
+            if plan and plan != profile.plan:
+                profile_repo.update_profile(profile.id, plan=plan)
+        else:
+            observation = classify_anthropic(status, filter_response_headers(headers), now)
+
+        # Only AUTHORITATIVE observations are recorded. A probe is a real
+        # request with a properly resolved credential, so what it learns about
+        # the ACCOUNT is as true as anything real traffic learns: a usage
+        # reading, a rejected credential, an exhausted quota.
+        #
+        # Everything else is discarded: an unclassifiable response, a 5xx, or
+        # a short rate-limit says something about this one small request or
+        # about the provider right now, not about the account. A single probe
+        # is weak evidence for those, and acting on it would take a healthy
+        # account out of rotation over a blip.
+        #
+        # (This deliberately allows AuthInvalid, which an earlier version did
+        # not. That restriction existed because the probe was mis-resolving
+        # credentials and manufacturing false 401s — the resolution bug is
+        # fixed, so suppressing the result now just hides a genuinely dead
+        # credential from the Dashboard.)
+        if not isinstance(observation, (UsageSnapshot, AuthInvalid, QuotaExhausted)):
+            return
+        if model_windows is not None and isinstance(observation, UsageSnapshot):
+            # The one place the header analogy breaks: per-model windows have
+            # no header form, so a usage read attaches them here.
+            from dataclasses import replace as _replace_snapshot
+            observation = _replace_snapshot(observation, model_windows=tuple(model_windows))
+
+        with _gateway._lock:
+            _gateway._observe(profile.id, observation, now)
+        _gateway._persist()
+    except Exception:  # noqa: BLE001 - never let a ping break its caller
+        return
+
+
+def _prime_profile(profile_id: str) -> None:
+    """Records usage for a Profile that has never served a request.
+
+    Usage percentages and reset times come from response headers, so a freshly
+    added Profile has no runtime state at all and the Dashboard shows it blank
+    until the account happens to be used. That made the first thing a person
+    sees after connecting an account the least accurate.
+
+    One request, on the same minimal ping "Test connection" already uses, and
+    never repeated: this is not polling. A failure is not surfaced — the
+    Profile exists either way, and the next real request populates it.
+    """
+    try:
+        profile = next((p for p in profile_repo.list_profiles() if p.id == profile_id), None)
+        if profile is None or not profile.enabled:
+            return
+        result = connection_test.test_connection(
+            profile_id, credential=_resolved_credential(profile))
+    except Exception:  # noqa: BLE001 - priming is best-effort by design
+        return
+
+    _record_ping(profile, result)
+
+
+def _prime_profile_async(profile_id: str) -> None:
+    """Primes in the background so adding a Profile stays instant."""
+    threading.Thread(target=_prime_profile, args=(profile_id,), daemon=True).start()
+
+
+def _public_update_state(settings=None) -> dict:
+    """The wire shape for update state. Shared by every endpoint that returns
+    it, so a check response can never come back missing fields the Dashboard
+    is already displaying."""
+    settings = settings or load_pool().settings
+    with _update_lock:
+        state = dict(_update_state)
+    state["current_version"] = __version__
+    state["update_mode"] = settings.update_mode
+    return state
+
+
+def _restart_for_update(port: int) -> bool:
+    """Restarts this daemon so freshly installed code is actually running.
+
+    Installing only replaces files on disk; the running process keeps serving
+    the version it started with, so without this an update appears to do
+    nothing and the reported version never changes.
+
+    Two shapes of daemon exist. A service-managed one is the service manager's
+    to bounce. One started detached — which is what install.sh does, and
+    `claude-unlimited start` — is nobody's, so a replacement is launched that
+    waits for this process to release the port before binding it.
+
+    Returns True if a restart was actually arranged."""
+    _gateway._persist()  # so the replacement comes back showing what this one showed
+
+    if daemon_installer.status()["installed"]:
+        try:
+            daemon_installer.start()  # atomic stop+start
+            return True
+        except daemon_installer.DaemonInstallerError as exc:
+            activity.record("error", "Update installed but the restart failed",
+                             meta=f"restart the daemon to finish ({exc})")
+            return False
+
+    # Detached: hand off to a replacement that starts once the port is free.
+    handoff = (
+        "import socket, subprocess, sys, time\n"
+        f"port = {int(port)}\n"
+        "for _ in range(120):\n"
+        "    s = socket.socket()\n"
+        "    try:\n"
+        "        s.bind(('127.0.0.1', port)); s.close(); break\n"
+        "    except OSError:\n"
+        "        s.close(); time.sleep(0.5)\n"
+        f"subprocess.Popen([{sys.executable!r}, '-m', 'claude_unlimited', 'start', "
+        f"'--port', str(port)], start_new_session=True)\n"
+    )
+    try:
+        subprocess.Popen([sys.executable, "-c", handoff], start_new_session=True,
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        activity.record("error", "Update installed but the restart failed",
+                         meta=f"restart the daemon to finish ({exc})")
+        return False
+
+    threading.Timer(0.5, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+    return True
+
+
+def _run_update_check(settings=None, *, respect_idle: bool = True,
+                      mode_override: Optional[str] = None) -> dict:
+    """One check-and-act pass honoring the configured update_mode.
+
+    In auto_install mode the install is held back while the pool is in use:
+    installing swaps the code out from under a running daemon and needs a
+    restart to take effect, which would end a live session mid-turn. The
+    download still happens immediately, so applying it later is just a file
+    move and a restart.
+
+    Never raises: it runs from a background thread and from a request
+    handler."""
+    settings = settings or load_pool().settings
+    # mode_override exists so "Check now" can mean only that. Without it the
+    # button honoured the configured mode and, on auto_install, downloaded and
+    # installed a release — software installing itself from a button that
+    # says it is looking.
+    mode = mode_override or settings.update_mode
+    deferred = False
+    if (respect_idle and mode in updater.MODE_INSTALLS
+            and not _gateway.is_idle(_UPDATE_IDLE_REQUIRED_SECONDS)):
+        mode = "auto_download"  # fetch and verify now, install once idle
+        deferred = True
+
+    outcome = updater.run_update_cycle(__version__, mode)
+    _record_update_outcome(outcome, settings)
+    with _update_lock:
+        _update_state["install_deferred_until_idle"] = bool(deferred and outcome.action == "downloaded")
+    # An immediate auto-install (pool was idle at check time) has swapped the
+    # code on disk but the running process is still the old one — restart so
+    # the update actually takes effect. Previously only the DEFERRED path
+    # restarted, so an install that happened to land while idle silently did
+    # nothing until the next restart.
+    if outcome.action == "installed":
+        _restart_for_update(_RUNNING_PORT)
+    return _public_update_state(settings)
+
+
+def _install_deferred_update_if_idle() -> None:
+    """Applies an update that was downloaded while the pool was busy, once it
+    has been quiet long enough, then restarts so the new code is actually
+    running."""
+    with _update_lock:
+        pending = _update_state.get("install_deferred_until_idle")
+    if not pending or not _gateway.is_idle(_UPDATE_IDLE_REQUIRED_SECONDS):
+        return
+    settings = load_pool().settings
+    if settings.update_mode not in updater.MODE_INSTALLS:
+        return
+
+    outcome = updater.run_update_cycle(__version__, "auto_install")
+    _record_update_outcome(outcome, settings)
+    with _update_lock:
+        _update_state["install_deferred_until_idle"] = outcome.action == "downloaded"
+    if outcome.action != "installed":
+        return
+    _restart_for_update(_RUNNING_PORT)
+
+
+def _note_user_activity() -> None:
+    """Any sign someone is using Claude Unlimited: a proxied request or real
+    Dashboard input. Coming back from an idle pause checks usage straight
+    away rather than on the next tick."""
+    try:
+        if _usage_probe.note_activity():
+            threading.Thread(target=_run_usage_probe_tick, daemon=True, name="usage-probe-resume").start()
+    except Exception:  # noqa: BLE001 - presence tracking must never break a request
+        pass
+
+
+def _usage_probe_candidates(pool) -> list:
+    runtime = _gateway.runtime_snapshot()
+    observed = _gateway.usage_observed_at()
+    # A Profile that just took a 429 its account-level windows
+    # cannot explain gets its usage re-read now rather than up to ten minutes
+    # from now. Presenting it as "never observed" is the whole mechanism —
+    # Scheduler.due() skips only the INTERVAL gate for those, so the provider
+    # pause and the per-Profile backoff still apply exactly as before. No new
+    # polling loop (invariant 2); this rides the tick that already runs.
+    forced = _gateway.take_usage_recheck_requests()
+    candidates = []
+    for profile in pool.profiles:
+        provider = usage_probe.provider_for(profile)
+        if provider is None or not profile.enabled:
+            continue
+        rt = runtime.get(profile.id)
+        # A Profile that needs re-auth is the refresh loop's business; a read
+        # would only fail, and failing reads are exactly the noise to avoid.
+        if rt is not None and rt.state.value in ("auth_invalid", "disabled"):
+            continue
+        observed_at = None if profile.id in forced else observed.get(profile.id)
+        candidates.append(usage_probe.Candidate(profile.id, provider, observed_at))
+    return candidates
+
+
+def _probe_usage(profile) -> None:
+    provider = usage_probe.provider_for(profile)
+    try:
+        stored = profile_repo.secret_store.get_token(profile.id)
+        if provider == usage_probe.PROVIDER_ANTHROPIC:
+            # Through the Gateway's refresh, which owns the one per-Profile
+            # refresh backoff clock — never a second, competing refresh path.
+            result = usage_probe.fetch_anthropic_usage(_gateway._maybe_refresh_credential(profile, stored))
+        else:
+            from . import openai_bridge, openai_credential
+            credential = openai_bridge._refresh_if_needed(profile, openai_credential.decode(stored))
+            result = usage_probe.fetch_codex_usage(credential)
+    except Exception:  # noqa: BLE001 - counted as a failure, with backoff
+        result = usage_probe.ProbeResult(status=None)
+    message = _usage_probe.record(profile.id, provider, result)
+    if result.status == 200 and result.headers:
+        _record_ping(profile, {"status": 200, "headers": result.headers},
+                     model_windows=result.model_windows)
+    if message:
+        activity.record("error", f"{profile.name} — usage check paused", meta=message)
+
+
+def _run_usage_probe_tick() -> None:
+    """One pass: read usage for whichever accounts are due. Never overlaps
+    itself (a resume can race the timer), never raises."""
+    if not _usage_probe_tick_lock.acquire(blocking=False):
+        return
+    try:
+        pool = load_pool()
+        if not pool.settings.keep_usage_fresh:
+            return
+        for profile_id in _usage_probe.due(_usage_probe_candidates(pool)):
+            profile = pool.get(profile_id)
+            if profile is not None:
+                _probe_usage(profile)
+    except Exception:  # noqa: BLE001 - a background courtesy, never a crash
+        pass
+    finally:
+        _usage_probe_tick_lock.release()
+
+
+def _usage_probe_loop() -> None:
+    while True:
+        woken = _gateway.usage_recheck_wakeup.wait(usage_probe.TICK_SECONDS)
+        _gateway.usage_recheck_wakeup.clear()
+        if woken:
+            # Only a re-auth sets this (see Gateway._queue_recovered_usage_read)
+            # — someone just signed an account back in, which is use, so the
+            # idle gate must not swallow the read they are waiting to see.
+            try:
+                _usage_probe.note_activity()
+            except Exception:  # noqa: BLE001
+                pass
+        _run_usage_probe_tick()
+
+
+def _update_check_loop() -> None:
+    """Polls for a new release on a slow timer.
+
+    Deliberately unhurried and jittered by the startup delay: this is a
+    background courtesy, not something worth hammering a public API for.
+    Every pass is best-effort, so being offline is a no-op, not a crash."""
+    time.sleep(_UPDATE_CHECK_STARTUP_DELAY_SECONDS)
+    since_last_check = _UPDATE_CHECK_INTERVAL_SECONDS
+    while True:
+        try:
+            if since_last_check >= _UPDATE_CHECK_INTERVAL_SECONDS:
+                _run_update_check()
+                since_last_check = 0
+            else:
+                # Between full checks, keep asking whether an already
+                # downloaded update can finally be applied.
+                _install_deferred_update_if_idle()
+        except Exception:
+            pass
+        # Its OWN step, deliberately not inside run_update_cycle(): that
+        # function returns early on every no-op path (no release, not
+        # newer, offline), so a refresh hooked inside it would almost never
+        # run (docs/tickets/007, constraint 1). This is the hourly
+        # BASELINE: refresh_if_due() is a timestamp comparison until an
+        # hour has passed, then a ~1 KB sha check that downloads the real
+        # file only when the sha changed, and backs off hard on failure or
+        # rate limiting — calling it every tick is cheap and can never turn
+        # into request spam. Session launches may refresh sooner via
+        # POST /api/models/refresh (see do_POST).
+        try:
+            model_catalogue.refresh_if_due()
+        except Exception:
+            pass
+        time.sleep(_UPDATE_IDLE_RECHECK_SECONDS)
+        since_last_check += _UPDATE_IDLE_RECHECK_SECONDS
+
+
+def _oauth_refresh_loop() -> None:
+    """Keeps OAuth Profiles' access tokens fresh independently of traffic.
+
+    The Dashboard's poll only runs while someone has it open, and the
+    proxy's per-request refresh only touches the Profile choose() just
+    picked. Without this loop, an idle Profile can pass its token expiry
+    unrefreshed and land on AUTH_INVALID, with no way back except a manual
+    re-auth, since choose() never picks an AUTH_INVALID Profile again.
+
+    Runs for the life of the daemon process. Every call is best-effort, so
+    a transient network failure can never crash the daemon."""
+    while True:
+        time.sleep(_OAUTH_REFRESH_LOOP_INTERVAL_SECONDS)
+        try:
+            _gateway.runtime_snapshot()
+        except Exception:
+            pass
+
+
+def run_foreground(host: str = LOOPBACK_HOST, port: int = DEFAULT_PORT) -> None:
+    server = make_server(host, port)
+    # Offline load (cache, else vendored snapshot) — synchronous but reads
+    # one small local file, so startup never waits on the network. No fetch
+    # happens here at all: refreshing is driven by `code` session launches
+    # (POST /api/models/refresh) and the hourly update-loop tick.
+    model_catalogue.initialize()
+    # Move the JSONL logs into the store, once. Idempotent and best-effort: a
+    # failure leaves the sources exactly where they were (see db.py).
+    try:
+        imported = db.import_legacy_logs()
+        if imported["usage_imported"] or imported["activity_imported"]:
+            activity.record("config", "Statistics moved into the local database",
+                            meta=f"{imported['usage_imported']} usage + {imported['activity_imported']} activity rows")
+    except Exception:
+        pass
+    # Self-heal the CLI launchers on startup. The auto-updater only self-heals
+    # from the release AFTER the fix (the OLD updater installs the new tree),
+    # so a new command name — `cu`, added in 1.2.6 — would otherwise not reach
+    # `~/.local/bin` until an extra update. Doing it here means the moment this
+    # version's daemon runs (a restart the user does anyway), the alias exists.
+    # Best-effort: a launcher we can't write must never stop the daemon.
+    try:
+        updater.ensure_cli_aliases()
+    except Exception:
+        pass
+    # Same self-heal, same reason, for the macOS HUD: an update is applied by
+    # the OLD updater, so the only way the HUD reaches an existing install is
+    # for the NEW code to put it there. On a background thread — it downloads,
+    # and nothing about the dashboard should wait for that.
+    threading.Thread(target=hud.keep_installed, args=(__version__,),
+                     daemon=True, name="hud-install").start()
+    threading.Thread(target=_oauth_refresh_loop, daemon=True).start()
+    threading.Thread(target=_update_check_loop, daemon=True).start()
+    threading.Thread(target=_usage_probe_loop, daemon=True, name="usage-probe").start()
+    print(f"CSRF token for this run (Dashboard needs it, never logged again): {_CSRF_TOKEN}")
+    # Written on every start on every OS. Harmless where the installer
+    # backend gets a pid another way (launchctl, systemctl), and the only
+    # way the Windows Task Scheduler backend knows what to stop, since
+    # schtasks doesn't expose a scheduled task's child-process pid.
+    try:
+        ensure_app_dir()
+        PID_FILE.write_text(str(os.getpid()))
+    except OSError:
+        pass
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        # Closes the store's connection, which truncates the write-ahead log.
+        # Left open across a restart, that log is what the next start has to
+        # rebuild an index over before its first read.
+        db.close_this_thread()
+        try:
+            PID_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+# Deliberately no find_free_loopback_port() here. It existed, was never called,
+# and falling back to an arbitrary port would have been wrong for this daemon:
+# DEFAULT_PORT is recorded in Claude Code's settings and in the desktop app's
+# inference profile, so moving the daemon silently would point both at nothing.
+# A port already in use is a conflict to report, not one to route around.
